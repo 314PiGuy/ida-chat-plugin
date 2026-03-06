@@ -26,7 +26,7 @@ logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE, mode="a"),
+        logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"),
     ]
 )
 logger = logging.getLogger("ida-chat")
@@ -64,7 +64,7 @@ def _load_system_prompt() -> str:
     prompt = ""
 
     if PROMPT_FILE.exists():
-        prompt = PROMPT_FILE.read_text()
+        prompt = PROMPT_FILE.read_text(encoding="utf-8")
     else:
         logger.warning(f"PROMPT.md not found at {PROMPT_FILE}")
         prompt = "You have access to an open IDA database via the `db` variable. Use <idascript> tags for code."
@@ -73,12 +73,12 @@ def _load_system_prompt() -> str:
     if os.environ.get("IDA_CHAT_INSIDE_IDA") == "1":
         if IDA_UI_FILE.exists():
             logger.info("Running inside IDA - appending IDA.md to system prompt")
-            prompt += "\n\n" + IDA_UI_FILE.read_text()
+            prompt += "\n\n" + IDA_UI_FILE.read_text(encoding="utf-8")
         else:
             logger.warning(f"IDA.md not found at {IDA_UI_FILE}")
 
-    prompt += "\n\n" + USAGE_FILE.read_text()
-    prompt += "\n\n" + API_REFERENCE_FILE.read_text()
+    prompt += "\n\n" + USAGE_FILE.read_text(encoding="utf-8")
+    prompt += "\n\n" + API_REFERENCE_FILE.read_text(encoding="utf-8")
     return prompt
 
 

@@ -210,7 +210,7 @@ def run_transcript_command(args: list[str]) -> int:
                 count = 0
                 first_msg = None
                 try:
-                    with open(session_file, "r") as f:
+                    with open(session_file, "r", encoding="utf-8") as f:
                         for line in f:
                             line = line.strip()
                             if not line:
