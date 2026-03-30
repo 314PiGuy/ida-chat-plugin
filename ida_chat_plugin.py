@@ -21,7 +21,10 @@ import ida_idaapi
 import ida_kernwin
 import ida_settings
 from ida_domain import Database
+from PySide6 import QtWidgets
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QGroupBox,
     QVBoxLayout,
     QHBoxLayout,
     QLabel,
@@ -36,6 +39,8 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QLineEdit,
     QComboBox,
+    QTabWidget,
+    QTextBrowser,
 )
 from PySide6.QtCore import Qt, Signal, QThread, QObject, QTimer
 from PySide6.QtGui import QKeyEvent, QPalette, QFont, QPixmap
@@ -1761,10 +1766,16 @@ class IDAChatForm(ida_kernwin.PluginForm):
         """Called when agent connection fails."""
         self.chat_history.add_message(f"Connection error: {error}", is_user=False)
 
+    def _log_metric(self, msg: str):
+        import time
+        ts = time.strftime("%H:%M:%S")
+        self.metrics_browser.append(f"[{ts}] {msg}")
+
     def _on_turn_start(self, turn: int, max_turns: int):
         """Called at the start of each agentic turn."""
         self._current_turn = turn
         self._max_turns = max_turns
+        self._log_metric(f"Turn started: {turn}/{max_turns}")
 
     def _on_thinking(self):
         """Called when agent starts processing."""
@@ -1816,6 +1827,7 @@ class IDAChatForm(ida_kernwin.PluginForm):
         if details:
             tool_msg += f" {details}"
         self._add_processing_message(tool_msg, MessageType.TOOL_USE)
+        self._log_metric(f"Tool executed: {tool_name} (details: {details[:100]}...)")
 
     def _on_text(self, text: str):
         """Called when agent outputs text."""
@@ -1828,6 +1840,7 @@ class IDAChatForm(ida_kernwin.PluginForm):
         # Update timeline
         self._script_count += 1
         self.progress_timeline.add_stage(f"Script {self._script_count}")
+        self._log_metric(f"Executing script {self._script_count} ({len(code)} bytes)")
         # Show preview of the script
         lines = code.strip().split('\n')
         preview = '\n'.join(lines[:5])
@@ -1857,10 +1870,12 @@ class IDAChatForm(ida_kernwin.PluginForm):
     def _on_error(self, error: str):
         """Called when an error occurs."""
         self._add_processing_message(f"Error: {error}", MessageType.ERROR)
+        self._log_metric(f"ERROR: {error}")
 
     def _on_result(self, _num_turns: int, cost: float):
         """Called when agent returns result with stats."""
         self._total_cost += cost
+        self._log_metric(f"Result returned. Turn count: {_num_turns}, Request cost: ${cost:.4f}, Total cost: ${self._total_cost:.4f}")
 
     def _on_finished(self):
         """Called when agent finishes processing."""
@@ -2000,9 +2015,33 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self.progress_timeline = ProgressTimeline()
         layout.addWidget(self.progress_timeline)
 
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet(f"""
+            QTabWidget::pane {{
+                border: none;
+                border-top: 1px solid {colors['mid']};
+            }}
+            QTabBar::tab {{
+                background: transparent;
+                color: {colors['text']};
+                padding: 4px 12px;
+                border: none;
+            }}
+            QTabBar::tab:selected {{
+                color: {colors['highlight']};
+                border-bottom: 2px solid {colors['highlight']};
+            }}
+        """)
+
+        # --- Chat Tab ---
+        chat_tab = QWidget()
+        chat_layout = QVBoxLayout(chat_tab)
+        chat_layout.setContentsMargins(0, 0, 0, 0)
+        chat_layout.setSpacing(0)
+
         # Chat history area (takes most space)
         self.chat_history = ChatHistoryWidget()
-        layout.addWidget(self.chat_history, stretch=1)
+        chat_layout.addWidget(self.chat_history, stretch=1)
 
         # Input area at bottom
         self.input_container = QWidget()
@@ -2016,7 +2055,7 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self.input_widget.cancel_requested.connect(self._on_cancel)
         input_layout.addWidget(self.input_widget, stretch=1)
 
-        layout.addWidget(self.input_container)
+        chat_layout.addWidget(self.input_container)
 
         # Status bar at bottom
         self.status_bar = QWidget()
@@ -2027,7 +2066,22 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self.status_label.setStyleSheet(f"color: {colors['mid']}; font-size: 11px;")
         status_layout.addWidget(self.status_label)
 
-        layout.addWidget(self.status_bar)
+        chat_layout.addWidget(self.status_bar)
+        
+        self.tabs.addTab(chat_tab, "Chat")
+
+        # --- Metrics Tab ---
+        metrics_tab = QWidget()
+        metrics_layout = QVBoxLayout(metrics_tab)
+        metrics_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.metrics_browser = QTextBrowser()
+        self.metrics_browser.setStyleSheet(f"background-color: {colors['base']}; color: {colors['text']}; font-family: monospace; border: none; padding: 4px;")
+        metrics_layout.addWidget(self.metrics_browser)
+        
+        self.tabs.addTab(metrics_tab, "Metrics & Events")
+
+        layout.addWidget(self.tabs, stretch=1)
 
         self.parent.setLayout(layout)
 
