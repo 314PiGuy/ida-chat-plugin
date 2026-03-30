@@ -44,6 +44,22 @@ class CLICallback(ChatCallback):
     def __init__(self):
         self.console = Console()
 
+    def on_metric(self, text: str) -> None:
+        print(f"{Colors.DIM}[metric] {text}{Colors.RESET}")
+
+    def on_event(
+        self,
+        kind: str,
+        title: str,
+        details: str,
+        duration_ms: float | None = None,
+    ) -> None:
+        duration_text = f" ({duration_ms:.1f}ms)" if duration_ms is not None else ""
+        print(f"{Colors.DIM}[event:{kind}] {title}{duration_text}{Colors.RESET}")
+        if details.strip():
+            preview = details if len(details) <= 500 else details[:500] + "\n... (truncated)"
+            self.console.print(Syntax(preview, "text", theme="monokai", line_numbers=False))
+
     def on_turn_start(self, turn: int, max_turns: int) -> None:
         pass  # Don't display turn info in UI
 

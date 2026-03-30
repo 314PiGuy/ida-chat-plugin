@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import time
 from io import StringIO
 
 # Signal to core that we're running inside IDA Pro (enables UI interaction API)
@@ -41,6 +42,9 @@ from PySide6.QtWidgets import (
     QComboBox,
     QTabWidget,
     QTextBrowser,
+    QListWidget,
+    QListWidgetItem,
+    QSplitter,
 )
 from PySide6.QtCore import Qt, Signal, QThread, QObject, QTimer
 from PySide6.QtGui import QKeyEvent, QPalette, QFont, QPixmap
@@ -777,6 +781,74 @@ class ChatHistoryWidget(QScrollArea):
                 item.widget().deleteLater()
 
 
+class EventLogWidget(QScrollArea):
+    """Scrollable event log with expandable details for tool/model I/O."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setFrameShape(QFrame.NoFrame)
+
+        self.container = QWidget()
+        self.layout = QVBoxLayout(self.container)
+        self.layout.setSpacing(6)
+        self.layout.setContentsMargins(8, 8, 8, 8)
+        self.layout.addStretch(1)
+        self.setWidget(self.container)
+
+    def clear_events(self):
+        """Clear all recorded events from the panel."""
+        while self.layout.count() > 1:
+            item = self.layout.takeAt(0)
+            if item and item.widget():
+                item.widget().deleteLater()
+
+    def add_event(
+        self,
+        kind: str,
+        title: str,
+        details: str = "",
+        duration_ms: float | None = None,
+    ) -> None:
+        """Append one event entry with optional expandable details."""
+        colors = get_ida_colors()
+
+        frame = QFrame()
+        frame.setStyleSheet(
+            f"""
+            QFrame {{
+                border: 1px solid {colors['mid']};
+                border-radius: 6px;
+                background-color: {colors['window']};
+            }}
+            """
+        )
+
+        frame_layout = QVBoxLayout(frame)
+        frame_layout.setContentsMargins(8, 6, 8, 6)
+        frame_layout.setSpacing(4)
+
+        ts = time.strftime("%H:%M:%S")
+        duration_text = f" · {duration_ms:.1f} ms" if duration_ms is not None and duration_ms >= 0 else ""
+        summary = QLabel(f"<b>[{ts}] {title}</b><span style='color:{colors['mid']};'> ({kind}){duration_text}</span>")
+        summary.setTextFormat(Qt.RichText)
+        summary.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        summary.setStyleSheet(f"color: {colors['text']};")
+        frame_layout.addWidget(summary)
+
+        if details.strip():
+            section = CollapsibleSection("Details", details, collapsed=True)
+            frame_layout.addWidget(section)
+
+        self.layout.insertWidget(self.layout.count() - 1, frame)
+        QTimer.singleShot(10, lambda: self.verticalScrollBar().setValue(self.verticalScrollBar().maximum()))
+
+
 class ChatInputWidget(QPlainTextEdit):
     """Multi-line text input with Enter to send and history navigation."""
 
@@ -910,6 +982,18 @@ class PluginCallback(ChatCallback):
     def __init__(self, signals: "AgentSignals"):
         self.signals = signals
 
+    def on_metric(self, text: str) -> None:
+        self.signals.metric.emit(text)
+
+    def on_event(
+        self,
+        kind: str,
+        title: str,
+        details: str,
+        duration_ms: float | None = None,
+    ) -> None:
+        self.signals.event.emit(kind, title, details, duration_ms if duration_ms is not None else -1.0)
+
     def on_turn_start(self, turn: int, max_turns: int) -> None:
         self.signals.turn_start.emit(turn, max_turns)
 
@@ -941,6 +1025,8 @@ class PluginCallback(ChatCallback):
 class AgentSignals(QObject):
     """Qt signals for agent callbacks."""
 
+    metric = Signal(str)
+    event = Signal(str, str, str, float)
     turn_start = Signal(int, int)
     thinking = Signal()
     thinking_done = Signal()
@@ -1511,6 +1597,8 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self._script_count = 0
         self._last_had_error = False
         self._message_count = 0
+        self._active_session_id: str | None = None
+        self._updating_session_list = False
         self._provider_config = get_provider_config()
         self._model_name = describe_provider(self._provider_config)
 
@@ -1569,6 +1657,7 @@ class IDAChatForm(ida_kernwin.PluginForm):
 
             # Create message history for this binary
             self.history = MessageHistory(db.path)
+            self._refresh_chat_session_list()
 
             if self.worker:
                 self.worker.request_disconnect()
@@ -1585,6 +1674,8 @@ class IDAChatForm(ida_kernwin.PluginForm):
             # Connect signals
             self.worker.signals.connection_ready.connect(self._on_connection_ready)
             self.worker.signals.connection_error.connect(self._on_connection_error)
+            self.worker.signals.metric.connect(self._on_metric)
+            self.worker.signals.event.connect(self._on_event)
             self.worker.signals.turn_start.connect(self._on_turn_start)
             self.worker.signals.thinking.connect(self._on_thinking)
             self.worker.signals.thinking_done.connect(self._on_thinking_done)
@@ -1717,8 +1808,7 @@ class IDAChatForm(ida_kernwin.PluginForm):
     def _show_onboarding(self):
         """Show onboarding panel, hide chat UI."""
         self.onboarding_panel.show()
-        self.chat_history.hide()
-        self.input_container.hide()
+        self.tabs.hide()
         self.progress_timeline.hide()
 
     def _show_settings(self):
@@ -1730,8 +1820,7 @@ class IDAChatForm(ida_kernwin.PluginForm):
     def _on_onboarding_complete(self):
         """Handle successful onboarding."""
         self.onboarding_panel.hide()
-        self.chat_history.show()
-        self.input_container.show()
+        self.tabs.show()
         self._init_agent()
 
     def _update_status_bar(self, processing_text: str | None = None):
@@ -1761,19 +1850,167 @@ class IDAChatForm(ida_kernwin.PluginForm):
         if hasattr(self, 'history'):
             user_messages = self.history.get_all_user_messages()
             self.input_widget.set_history(user_messages)
+            self._active_session_id = self.history.get_current_session_id()
+            self._refresh_chat_session_list(select_session_id=self._active_session_id)
+
+    def _refresh_chat_session_list(self, select_session_id: str | None = None):
+        """Refresh the chats panel list from persistent session history."""
+        if not hasattr(self, "history") or not self.history:
+            return
+
+        self._updating_session_list = True
+        self.chat_session_list.clear()
+
+        sessions = self.history.list_sessions()
+        for session in sessions:
+            session_id = session.get("id", "")
+            first_message = str(session.get("first_message", "(empty)"))
+            timestamp = str(session.get("timestamp", ""))
+            short_id = session_id[:8]
+            label = f"{short_id}  {first_message}"
+            if timestamp:
+                label = f"{timestamp[:19]}  {label}"
+
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, session_id)
+            self.chat_session_list.addItem(item)
+
+            should_select = False
+            if select_session_id and session_id == select_session_id:
+                should_select = True
+            elif not select_session_id and self._active_session_id and session_id == self._active_session_id:
+                should_select = True
+
+            if should_select:
+                self.chat_session_list.setCurrentItem(item)
+
+        self._updating_session_list = False
+
+    def _extract_text_content(self, content) -> str:
+        """Extract human-readable text from transcript content structures."""
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return ""
+
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            elif item_type == "tool_result":
+                result = item.get("content")
+                parts.append(str(result))
+        return "\n".join(part for part in parts if part)
+
+    def _load_session_into_chat(self, session_id: str):
+        """Load one persisted chat session into the chat view."""
+        if not hasattr(self, "history") or not self.history:
+            return
+
+        entries = self.history.load_session(session_id)
+        self.chat_history.clear_history()
+
+        for entry in entries:
+            entry_type = entry.get("type")
+            message = entry.get("message", {}) if isinstance(entry, dict) else {}
+
+            if entry_type == "user":
+                text = self._extract_text_content(message.get("content", ""))
+                if text:
+                    self.chat_history.add_message(text, is_user=True)
+                continue
+
+            if entry_type == "assistant":
+                content = message.get("content", [])
+                if isinstance(content, list):
+                    for item in content:
+                        if not isinstance(item, dict):
+                            continue
+                        item_type = item.get("type")
+                        if item_type == "text":
+                            text = item.get("text", "")
+                            if text:
+                                self.chat_history.add_message(str(text), is_user=False)
+                        elif item_type == "tool_use":
+                            name = str(item.get("name", "Tool"))
+                            tool_input = item.get("input", {})
+                            details = json.dumps(tool_input, ensure_ascii=False)
+                            self.chat_history.add_message(
+                                f"[{name}] {details}",
+                                is_user=False,
+                                msg_type=MessageType.TOOL_USE,
+                            )
+                continue
+
+            if entry_type == "system":
+                system_text = str(entry.get("content", "")).strip()
+                if system_text:
+                    self.chat_history.add_message(f"[System] {system_text}", is_user=False)
+
+        if not entries:
+            self.chat_history.add_message("Selected chat is empty.", is_user=False)
+
+    def _start_new_chat(self):
+        """Create and switch to a new chat session."""
+        if self._is_processing:
+            self.chat_history.add_message("Finish the current request before starting a new chat.", is_user=False)
+            return
+        if not hasattr(self, "history") or not self.history:
+            return
+
+        new_session_id = self.history.start_new_session()
+        self._active_session_id = new_session_id
+        self.chat_history.clear_history()
+        self.chat_history.add_message("Started a new chat session.", is_user=False)
+        self._refresh_chat_session_list(select_session_id=new_session_id)
+        self.input_widget.set_history(self.history.get_all_user_messages())
+        self._log_metric(f"Started new chat: {new_session_id[:8]}")
+
+    def _on_chat_session_selected(self):
+        """Switch active chat when the user selects another session."""
+        if self._updating_session_list or self._is_processing:
+            return
+        if not hasattr(self, "history") or not self.history:
+            return
+
+        item = self.chat_session_list.currentItem()
+        if not item:
+            return
+
+        session_id = item.data(Qt.UserRole)
+        if not isinstance(session_id, str) or not session_id:
+            return
+        if session_id == self._active_session_id:
+            return
+
+        if not self.history.switch_session(session_id):
+            self.chat_history.add_message("Unable to switch to selected chat session.", is_user=False)
+            return
+
+        self._active_session_id = session_id
+        self._load_session_into_chat(session_id)
+        self.input_widget.set_history(self.history.get_all_user_messages())
+        self._log_metric(f"Switched to chat: {session_id[:8]}")
 
     def _on_connection_error(self, error: str):
         """Called when agent connection fails."""
         self.chat_history.add_message(f"Connection error: {error}", is_user=False)
 
     def _log_metric(self, msg: str):
-        import time
-        ts = time.strftime("%H:%M:%S")
-        self.metrics_browser.append(f"[{ts}] {msg}")
+        self.events_log.add_event("metric", msg)
 
-    def on_metric(self, text: str):
-        """Route generic metric string from core."""
-        self.metrics_signal.emit(text)
+    def _on_metric(self, text: str):
+        """Called for simple metric lines emitted from core."""
+        self._log_metric(text)
+
+    def _on_event(self, kind: str, title: str, details: str, duration_ms: float):
+        """Called for structured, expandable core events."""
+        self.events_log.add_event(kind, title, details, duration_ms if duration_ms >= 0 else None)
 
     def _on_turn_start(self, turn: int, max_turns: int):
         """Called at the start of each agentic turn."""
@@ -2043,9 +2280,61 @@ class IDAChatForm(ida_kernwin.PluginForm):
         chat_layout.setContentsMargins(0, 0, 0, 0)
         chat_layout.setSpacing(0)
 
+        chat_splitter = QSplitter(Qt.Horizontal)
+
+        # Sessions panel (new chat + switch chats)
+        sessions_panel = QWidget()
+        sessions_layout = QVBoxLayout(sessions_panel)
+        sessions_layout.setContentsMargins(8, 8, 8, 8)
+        sessions_layout.setSpacing(6)
+
+        sessions_title = QLabel("Chats")
+        sessions_title.setStyleSheet(f"color: {colors['window_text']}; font-weight: bold;")
+        sessions_layout.addWidget(sessions_title)
+
+        self.new_chat_btn = QPushButton("New Chat")
+        self.new_chat_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {colors['button']};
+                color: {colors['button_text']};
+                border: 1px solid {colors['mid']};
+                border-radius: 4px;
+                padding: 4px 8px;
+            }}
+            QPushButton:hover {{
+                background-color: {colors['highlight']};
+                color: {colors['highlight_text']};
+            }}
+        """)
+        self.new_chat_btn.clicked.connect(self._start_new_chat)
+        sessions_layout.addWidget(self.new_chat_btn)
+
+        self.chat_session_list = QListWidget()
+        self.chat_session_list.itemSelectionChanged.connect(self._on_chat_session_selected)
+        self.chat_session_list.setStyleSheet(f"""
+            QListWidget {{
+                background-color: {colors['base']};
+                color: {colors['text']};
+                border: 1px solid {colors['mid']};
+                border-radius: 6px;
+                padding: 4px;
+            }}
+            QListWidget::item:selected {{
+                background-color: {colors['highlight']};
+                color: {colors['highlight_text']};
+            }}
+        """)
+        sessions_layout.addWidget(self.chat_session_list, stretch=1)
+
+        # Main chat panel
+        chat_main = QWidget()
+        chat_main_layout = QVBoxLayout(chat_main)
+        chat_main_layout.setContentsMargins(0, 0, 0, 0)
+        chat_main_layout.setSpacing(0)
+
         # Chat history area (takes most space)
         self.chat_history = ChatHistoryWidget()
-        chat_layout.addWidget(self.chat_history, stretch=1)
+        chat_main_layout.addWidget(self.chat_history, stretch=1)
 
         # Input area at bottom
         self.input_container = QWidget()
@@ -2059,7 +2348,7 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self.input_widget.cancel_requested.connect(self._on_cancel)
         input_layout.addWidget(self.input_widget, stretch=1)
 
-        chat_layout.addWidget(self.input_container)
+        chat_main_layout.addWidget(self.input_container)
 
         # Status bar at bottom
         self.status_bar = QWidget()
@@ -2070,7 +2359,12 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self.status_label.setStyleSheet(f"color: {colors['mid']}; font-size: 11px;")
         status_layout.addWidget(self.status_label)
 
-        chat_layout.addWidget(self.status_bar)
+        chat_main_layout.addWidget(self.status_bar)
+
+        chat_splitter.addWidget(sessions_panel)
+        chat_splitter.addWidget(chat_main)
+        chat_splitter.setSizes([220, 900])
+        chat_layout.addWidget(chat_splitter, stretch=1)
         
         self.tabs.addTab(chat_tab, "Chat")
 
@@ -2078,10 +2372,37 @@ class IDAChatForm(ida_kernwin.PluginForm):
         metrics_tab = QWidget()
         metrics_layout = QVBoxLayout(metrics_tab)
         metrics_layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.metrics_browser = QTextBrowser()
-        self.metrics_browser.setStyleSheet(f"background-color: {colors['base']}; color: {colors['text']}; font-family: monospace; border: none; padding: 4px;")
-        metrics_layout.addWidget(self.metrics_browser)
+
+        metrics_toolbar = QWidget()
+        metrics_toolbar_layout = QHBoxLayout(metrics_toolbar)
+        metrics_toolbar_layout.setContentsMargins(8, 6, 8, 6)
+
+        metrics_title = QLabel("Detailed model/tool events with expandable inputs, outputs, and timing")
+        metrics_title.setStyleSheet(f"color: {colors['mid']}; font-size: 11px;")
+        metrics_toolbar_layout.addWidget(metrics_title)
+        metrics_toolbar_layout.addStretch()
+
+        clear_events_btn = QPushButton("Clear Events")
+        clear_events_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {colors['button']};
+                color: {colors['button_text']};
+                border: 1px solid {colors['mid']};
+                border-radius: 4px;
+                padding: 2px 8px;
+            }}
+            QPushButton:hover {{
+                background-color: {colors['highlight']};
+                color: {colors['highlight_text']};
+            }}
+        """)
+        clear_events_btn.clicked.connect(self._on_clear_events)
+        metrics_toolbar_layout.addWidget(clear_events_btn)
+
+        metrics_layout.addWidget(metrics_toolbar)
+
+        self.events_log = EventLogWidget()
+        metrics_layout.addWidget(self.events_log, stretch=1)
         
         self.tabs.addTab(metrics_tab, "Metrics & Events")
 
@@ -2163,14 +2484,23 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self.progress_timeline.hide_timeline()
 
         # Start a new session for history tracking
-        if self.worker:
-            self.worker.request_new_session()
+        if hasattr(self, "history") and self.history:
+            new_session_id = self.history.start_new_session()
+            self._active_session_id = new_session_id
+            self._refresh_chat_session_list(select_session_id=new_session_id)
+            self.input_widget.set_history(self.history.get_all_user_messages())
+            self._log_metric(f"Chat cleared. New session: {new_session_id[:8]}")
 
         # Add ready message (agent already connected)
         self.chat_history.add_message("Chat cleared. Ready for new conversation.", is_user=False)
         self.input_widget.setEnabled(True)
         self.input_widget.setFocus()
         self._update_status_bar()
+
+    def _on_clear_events(self):
+        """Clear metrics/events panel entries."""
+        self.events_log.clear_events()
+        self._log_metric("Event log cleared")
 
     def OnClose(self, form):
         """Called when the widget is closed."""

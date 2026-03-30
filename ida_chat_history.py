@@ -436,6 +436,38 @@ class MessageHistory:
         """Get the current session ID."""
         return self.session_id
 
+    def switch_session(self, session_id: str) -> bool:
+        """Switch active session to an existing session file.
+
+        Args:
+            session_id: Session UUID to activate.
+
+        Returns:
+            True if switched successfully, False if the session does not exist.
+        """
+        session_file = self.session_dir / f"{session_id}.jsonl"
+        if not session_file.exists():
+            return False
+
+        self.session_id = session_id
+        self.session_file = session_file
+        self._parent_uuid = None
+
+        with open(session_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg_uuid = entry.get("uuid")
+                if isinstance(msg_uuid, str) and msg_uuid:
+                    self._parent_uuid = msg_uuid
+
+        return True
+
     def get_all_user_messages(self) -> list[str]:
         """Get all user messages from all sessions for this binary.
 
