@@ -118,34 +118,35 @@ def set_show_wizard(value: bool) -> None:
 
 
 def _get_setting_str(key: str) -> str | None:
-    if ida_settings.has_current_plugin_setting(key):
-        value = ida_settings.get_current_plugin_setting(key)
-        if value is None:
-            return None
-        text = str(value).strip()
-        return text if text else None
+    try:
+        if ida_settings.has_current_plugin_setting(key):
+            value = ida_settings.get_current_plugin_setting(key)
+            if value is None:
+                return None
+            text = str(value).strip()
+            return text if text else None
+    except Exception:
+        return None
     return None
 
 
 def _set_setting_str(key: str, value: str | None) -> None:
-    if value is not None and value != "":
-        ida_settings.set_current_plugin_setting(key, value)
-    elif ida_settings.has_current_plugin_setting(key):
-        ida_settings.del_current_plugin_setting(key)
+    try:
+        if value is not None and value != "":
+            ida_settings.set_current_plugin_setting(key, value)
+        elif ida_settings.has_current_plugin_setting(key):
+            ida_settings.del_current_plugin_setting(key)
+    except Exception:
+        return
 
 
 def _get_legacy_auth_type() -> str | None:
-    if ida_settings.has_current_plugin_setting("auth_type"):
-        value = ida_settings.get_current_plugin_setting("auth_type")
-        return str(value).strip().lower() if value else None
-    return None
+    value = _get_setting_str("auth_type")
+    return value.lower() if value else None
 
 
 def _get_legacy_api_key() -> str | None:
-    if ida_settings.has_current_plugin_setting("api_key"):
-        value = ida_settings.get_current_plugin_setting("api_key")
-        return str(value).strip() if value else None
-    return None
+    return _get_setting_str("api_key")
 
 
 def _load_provider_profiles() -> dict[str, dict[str, str]]:
@@ -180,7 +181,7 @@ def _load_provider_profiles() -> dict[str, dict[str, str]]:
 
 
 def _save_provider_profiles(profiles: dict[str, dict[str, str]]) -> None:
-    ida_settings.set_current_plugin_setting(
+    _set_setting_str(
         PROVIDER_PROFILES_KEY,
         json.dumps(profiles, ensure_ascii=True),
     )
@@ -268,7 +269,7 @@ def save_provider_settings(config: ProviderConfig) -> None:
     profiles[provider] = profile
     _save_provider_profiles(profiles)
 
-    ida_settings.set_current_plugin_setting("provider", provider)
+    _set_setting_str("provider", provider)
 
     # Keep flat keys populated for backward compatibility with older versions.
     _set_setting_str("auth_mode", config.auth_mode)
@@ -278,7 +279,7 @@ def save_provider_settings(config: ProviderConfig) -> None:
 
     # Keep legacy auth_type populated for backward compatibility.
     legacy_auth = "system" if provider == "claude" and config.auth_mode == "system" else "api_key"
-    ida_settings.set_current_plugin_setting("auth_type", legacy_auth)
+    _set_setting_str("auth_type", legacy_auth)
 
     set_show_wizard(False)
 
