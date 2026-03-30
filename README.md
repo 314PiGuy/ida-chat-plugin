@@ -1,16 +1,17 @@
 # IDA Chat Plugin
 
-An AI-powered chat interface for IDA Pro using Claude Agent SDK. Ask questions about your binary and get intelligent analysis powered by Claude.
+An AI-powered chat interface for IDA Pro using Claude Agent SDK with multi-provider support. Ask questions about your binary and get intelligent analysis powered by Claude, Gemini, OpenAI, OpenRouter, Ollama, or NVIDIA NIM.
 
 https://github.com/user-attachments/assets/4377116d-337e-451a-8b80-85245e7501ce
 
 ## Features
 
 - Dockable chat widget inside IDA Pro (Ctrl+Shift+C to toggle)
-- AI-powered binary analysis using Claude
+- AI-powered binary analysis with multiple model providers
 - Automatic script generation and execution
 - Markdown rendering for formatted responses
 - Persistent chat history per database
+- In-window provider/model switching similar to Copilot model picker
 
 ## Requirements
 
@@ -38,17 +39,11 @@ Alternatively, download and install from a release:
    hcli plugin install ida-chat.zip
    ```
 
-3. On first launch, the setup wizard will guide you through authentication. You can also configure via command line:
-   ```bash
-   # Option 1: System authentication (recommended - uses Claude Code credentials)
-   hcli plugin install ida-chat.zip --config auth_type=system
+3. On first launch, the setup wizard will guide you through provider configuration.
 
-   # Option 2: API key
-   hcli plugin install ida-chat.zip --config auth_type=api_key --config api_key=YOUR_KEY
+Free-tier recommendation order: Gemini -> OpenRouter `:free` models -> NVIDIA NIM.
 
-   # Option 3: OAuth
-   hcli plugin install ida-chat.zip --config auth_type=oauth --config api_key=YOUR_TOKEN
-   ```
+After setup, switch provider/model directly from the top bar of the IDA Chat panel.
 
 ## Usage
 

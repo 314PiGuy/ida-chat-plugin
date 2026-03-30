@@ -5,7 +5,7 @@
     "entryPoint": "ida_chat_plugin.py",
     "version": "0.2.6",
     "idaVersions": ["9.0", "9.1", "9.2", "9.3"],
-    "description": "LLM Chat Client for IDA Pro - A dockable chat interface for AI-powered reverse engineering assistance using Claude Agent SDK.",
+    "description": "LLM Chat Client for IDA Pro - Multi-provider reverse engineering assistant (Claude, Gemini, OpenAI, OpenRouter, Ollama, NVIDIA NIM) embedded directly in IDA.",
     "license": "MIT",
     "categories": ["collaboration-and-productivity", "ui-ux-and-visualization"],
     "pythonDependencies": [
@@ -36,18 +36,41 @@
         "prompt": false
       },
       {
-        "key": "auth_type",
-        "name": "Authentication Type",
+        "key": "provider",
+        "name": "LLM Provider",
         "type": "string",
-        "description": "Authentication type: 'system', 'oauth', or 'api_key'",
+        "description": "Provider: claude, gemini, openai, openrouter, ollama, nim",
+        "default": "claude",
+        "required": false
+      },
+      {
+        "key": "auth_mode",
+        "name": "Authentication Mode",
+        "type": "string",
+        "description": "Authentication mode: system (Claude only) or api_key",
+        "default": "system",
         "required": false
       },
       {
         "key": "api_key",
         "name": "API Key",
         "type": "string",
-        "description": "API key or OAuth token (not needed for 'system' auth type)",
+        "description": "Provider API key/token (optional for Ollama local mode)",
         "sensitive": true,
+        "required": false
+      },
+      {
+        "key": "model",
+        "name": "Model Override",
+        "type": "string",
+        "description": "Optional model override for the selected provider",
+        "required": false
+      },
+      {
+        "key": "base_url",
+        "name": "Base URL Override",
+        "type": "string",
+        "description": "Optional base URL override (OpenAI-compatible endpoints supported)",
         "required": false
       }
     ]

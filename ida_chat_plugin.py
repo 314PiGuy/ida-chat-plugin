@@ -1,11 +1,12 @@
 """
 IDA Chat - LLM Chat Client Plugin for IDA Pro
 
-A dockable chat interface powered by Claude Agent SDK for
-AI-assisted reverse engineering within IDA Pro.
+A dockable chat interface powered by Claude Agent SDK with
+multi-provider model support for AI-assisted reverse engineering within IDA Pro.
 """
 
 import asyncio
+import json
 import os
 import re
 import sys
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QButtonGroup,
     QLineEdit,
+    QComboBox,
 )
 from PySide6.QtCore import Qt, Signal, QThread, QObject, QTimer
 from PySide6.QtGui import QKeyEvent, QPalette, QFont, QPixmap
@@ -41,8 +43,23 @@ from PySide6.QtGui import QKeyEvent, QPalette, QFont, QPixmap
 # Ensure local modules are importable
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
 
-from ida_chat_core import IDAChatCore, ChatCallback, test_claude_connection
+from ida_chat_core import IDAChatCore, ChatCallback, test_provider_connection
 from ida_chat_history import MessageHistory
+from ida_chat_provider import (
+    ProviderConfig,
+    SUPPORTED_PROVIDERS,
+    apply_provider_environment,
+    describe_provider,
+    normalize_provider,
+    provider_default_base_url,
+    provider_default_model,
+    provider_free_tier_note,
+    provider_key_hint,
+    provider_label,
+    provider_recommended_models,
+    resolve_model,
+    validate_provider_config,
+)
 
 
 # Plugin metadata
@@ -85,6 +102,8 @@ def get_ida_colors():
 # Settings Management (using ida-settings)
 # -----------------------------------------------------------------------------
 
+PROVIDER_PROFILES_KEY = "provider_profiles"
+
 
 def get_show_wizard() -> bool:
     """Returns whether to show the setup wizard."""
@@ -98,41 +117,177 @@ def set_show_wizard(value: bool) -> None:
     ida_settings.set_current_plugin_setting("show_wizard", value)
 
 
-def get_auth_type() -> str | None:
-    """Returns 'system', 'oauth', or 'api_key', or None if not configured."""
+def _get_setting_str(key: str) -> str | None:
+    if ida_settings.has_current_plugin_setting(key):
+        value = ida_settings.get_current_plugin_setting(key)
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text if text else None
+    return None
+
+
+def _set_setting_str(key: str, value: str | None) -> None:
+    if value is not None and value != "":
+        ida_settings.set_current_plugin_setting(key, value)
+    elif ida_settings.has_current_plugin_setting(key):
+        ida_settings.del_current_plugin_setting(key)
+
+
+def _get_legacy_auth_type() -> str | None:
     if ida_settings.has_current_plugin_setting("auth_type"):
-        return ida_settings.get_current_plugin_setting("auth_type")
+        value = ida_settings.get_current_plugin_setting("auth_type")
+        return str(value).strip().lower() if value else None
     return None
 
 
-def get_api_key() -> str | None:
-    """Returns the stored API key/token."""
+def _get_legacy_api_key() -> str | None:
     if ida_settings.has_current_plugin_setting("api_key"):
-        return ida_settings.get_current_plugin_setting("api_key")
+        value = ida_settings.get_current_plugin_setting("api_key")
+        return str(value).strip() if value else None
     return None
 
 
-def save_auth_settings(auth_type: str, api_key: str | None = None) -> None:
-    """Store authentication settings and disable wizard."""
-    ida_settings.set_current_plugin_setting("auth_type", auth_type)
-    if api_key:
-        ida_settings.set_current_plugin_setting("api_key", api_key)
-    elif ida_settings.has_current_plugin_setting("api_key"):
-        ida_settings.del_current_plugin_setting("api_key")
-    # Disable wizard after saving settings
+def _load_provider_profiles() -> dict[str, dict[str, str]]:
+    """Load provider profiles persisted as JSON in plugin settings."""
+    raw = _get_setting_str(PROVIDER_PROFILES_KEY)
+    if not raw:
+        return {}
+
+    try:
+        decoded = json.loads(raw)
+    except Exception:
+        return {}
+
+    if not isinstance(decoded, dict):
+        return {}
+
+    profiles: dict[str, dict[str, str]] = {}
+    for provider_name, profile_data in decoded.items():
+        provider = normalize_provider(str(provider_name))
+        if not isinstance(profile_data, dict):
+            continue
+
+        profile: dict[str, str] = {}
+        for key in ("auth_mode", "api_key", "model", "base_url"):
+            value = profile_data.get(key)
+            if isinstance(value, str) and value.strip():
+                profile[key] = value.strip()
+        if profile:
+            profiles[provider] = profile
+
+    return profiles
+
+
+def _save_provider_profiles(profiles: dict[str, dict[str, str]]) -> None:
+    ida_settings.set_current_plugin_setting(
+        PROVIDER_PROFILES_KEY,
+        json.dumps(profiles, ensure_ascii=True),
+    )
+
+
+def get_provider_config(provider: str | None = None) -> ProviderConfig:
+    """Load provider configuration from profile storage with migration support."""
+    active_provider = normalize_provider(provider or _get_setting_str("provider"))
+    profiles = _load_provider_profiles()
+
+    # Backward compatibility for existing installations using flat settings.
+    if provider is None and active_provider not in profiles:
+        flat_auth_mode = (_get_setting_str("auth_mode") or "").lower()
+        flat_api_key = _get_setting_str("api_key")
+        flat_model = _get_setting_str("model")
+        flat_base_url = _get_setting_str("base_url")
+
+        legacy_auth_type = _get_legacy_auth_type()
+        if not flat_auth_mode and legacy_auth_type:
+            flat_auth_mode = "system" if legacy_auth_type == "system" else "api_key"
+        if not flat_api_key:
+            flat_api_key = _get_legacy_api_key()
+
+        migrated_profile: dict[str, str] = {}
+        if flat_auth_mode in {"system", "api_key"}:
+            migrated_profile["auth_mode"] = flat_auth_mode
+        if flat_api_key:
+            migrated_profile["api_key"] = flat_api_key
+        if flat_model:
+            migrated_profile["model"] = flat_model
+        if flat_base_url:
+            migrated_profile["base_url"] = flat_base_url
+
+        if migrated_profile:
+            profiles[active_provider] = migrated_profile
+            _save_provider_profiles(profiles)
+
+    profile = profiles.get(active_provider, {})
+    auth_mode = str(profile.get("auth_mode", "")).lower()
+    if auth_mode not in {"system", "api_key"}:
+        auth_mode = "system" if active_provider == "claude" else "api_key"
+    if active_provider != "claude" and auth_mode == "system":
+        auth_mode = "api_key"
+
+    return ProviderConfig(
+        provider=active_provider,
+        auth_mode=auth_mode,
+        api_key=profile.get("api_key"),
+        model=profile.get("model"),
+        base_url=profile.get("base_url"),
+    )
+
+
+def get_configured_providers() -> list[str]:
+    """Return providers that have saved profiles, preserving known order."""
+    profiles = _load_provider_profiles()
+    active = normalize_provider(_get_setting_str("provider"))
+
+    configured = [provider for provider in SUPPORTED_PROVIDERS if provider in profiles]
+    if active not in configured:
+        configured.insert(0, active)
+
+    deduped: list[str] = []
+    for provider in configured:
+        if provider not in deduped:
+            deduped.append(provider)
+    return deduped
+
+
+def save_provider_settings(config: ProviderConfig) -> None:
+    """Persist provider settings and disable onboarding wizard."""
+    provider = normalize_provider(config.provider)
+    profiles = _load_provider_profiles()
+
+    profile: dict[str, str] = {
+        "auth_mode": config.auth_mode,
+    }
+    if config.api_key:
+        profile["api_key"] = config.api_key.strip()
+    if config.model:
+        profile["model"] = config.model.strip()
+    if config.base_url:
+        profile["base_url"] = config.base_url.strip()
+
+    profiles[provider] = profile
+    _save_provider_profiles(profiles)
+
+    ida_settings.set_current_plugin_setting("provider", provider)
+
+    # Keep flat keys populated for backward compatibility with older versions.
+    _set_setting_str("auth_mode", config.auth_mode)
+    _set_setting_str("api_key", (config.api_key or "").strip() or None)
+    _set_setting_str("model", (config.model or "").strip() or None)
+    _set_setting_str("base_url", (config.base_url or "").strip() or None)
+
+    # Keep legacy auth_type populated for backward compatibility.
+    legacy_auth = "system" if provider == "claude" and config.auth_mode == "system" else "api_key"
+    ida_settings.set_current_plugin_setting("auth_type", legacy_auth)
+
     set_show_wizard(False)
 
 
-def apply_auth_to_environment() -> None:
-    """Set environment variables based on stored settings."""
-    auth_type = get_auth_type()
-    api_key = get_api_key()
-    if auth_type == "system":
-        pass  # Use existing system configuration (keychain, env vars)
-    elif auth_type == "oauth" and api_key:
-        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = api_key
-    elif auth_type == "api_key" and api_key:
-        os.environ["ANTHROPIC_API_KEY"] = api_key
+def apply_auth_to_environment() -> ProviderConfig:
+    """Apply the currently configured provider environment variables."""
+    config = get_provider_config()
+    apply_provider_environment(config)
+    return config
 
 
 class CollapsibleSection(QFrame):
@@ -783,11 +938,12 @@ class AgentWorker(QThread):
     """Background worker for running async agent calls."""
 
     def __init__(self, db: Database, script_executor: Callable[[str], str],
-                 history: MessageHistory, parent=None):
+                 history: MessageHistory, provider_config: ProviderConfig, parent=None):
         super().__init__(parent)
         self.db = db
         self.script_executor = script_executor
         self.history = history
+        self.provider_config = provider_config
         self.signals = AgentSignals()
         self.callback = PluginCallback(self.signals)
         self.core: IDAChatCore | None = None
@@ -848,6 +1004,7 @@ class AgentWorker(QThread):
                     self.db,
                     self.callback,
                     script_executor=self.script_executor,
+                    provider_config=self.provider_config,
                     history=self.history,
                 )
                 await self.core.connect()
@@ -885,19 +1042,20 @@ class AgentWorker(QThread):
 
 
 class TestConnectionWorker(QThread):
-    """Background thread for testing Claude connection."""
+    """Background thread for testing provider connectivity."""
 
     finished = Signal(bool, str)  # (success, message)
 
-    def __init__(self, parent=None):
+    def __init__(self, provider_config: ProviderConfig, parent=None):
         super().__init__(parent)
+        self.provider_config = provider_config
 
     def run(self):
         """Run the connection test."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            success, message = loop.run_until_complete(test_claude_connection())
+            success, message = loop.run_until_complete(test_provider_connection(self.provider_config))
             self.finished.emit(success, message)
         except Exception as e:
             self.finished.emit(False, str(e))
@@ -968,37 +1126,58 @@ class OnboardingPanel(QFrame):
         layout.addWidget(title)
 
         # Instructions
-        instructions = QLabel("Configure your Claude authentication:")
+        instructions = QLabel("Configure your model provider and credentials:")
         instructions.setStyleSheet(f"QLabel {{ color: {colors['mid']}; }}")
         layout.addWidget(instructions)
+
+        # Provider selection
+        provider_title_label = QLabel("Provider")
+        provider_title_label.setStyleSheet(f"QLabel {{ color: {colors['text']}; font-weight: bold; }}")
+        layout.addWidget(provider_title_label)
+
+        self.provider_combo = QComboBox()
+        self.provider_combo.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {colors['alt_base']};
+                color: {colors['text']};
+                border: 1px solid {colors['mid']};
+                border-radius: 4px;
+                padding: 6px;
+            }}
+            QComboBox::drop-down {{
+                border: none;
+            }}
+        """)
+        for provider in SUPPORTED_PROVIDERS:
+            self.provider_combo.addItem(provider_label(provider), provider)
+        layout.addWidget(self.provider_combo)
+
+        self.provider_note = QLabel("")
+        self.provider_note.setWordWrap(True)
+        self.provider_note.setStyleSheet(f"QLabel {{ color: {colors['mid']}; font-size: 11px; }}")
+        layout.addWidget(self.provider_note)
 
         # Radio buttons for auth type
         self.auth_group = QButtonGroup(self)
 
-        # Option 1: System (use existing Claude installation)
-        self.radio_system = QRadioButton("Use Claude settings on my machine")
+        # Option 1: System (Claude only)
+        self.radio_system = QRadioButton("Use system credentials (Claude Code)")
         self.radio_system.setStyleSheet(f"QRadioButton {{ color: {colors['text']}; }}")
         self.radio_system.setChecked(True)
         self.auth_group.addButton(self.radio_system, 0)
         layout.addWidget(self.radio_system)
 
-        system_hint = QLabel("    Recommended if Claude Code is installed")
+        system_hint = QLabel("    Recommended for Claude when configured on this machine")
         system_hint.setStyleSheet(f"QLabel {{ color: {colors['mid']}; font-size: 11px; }}")
         layout.addWidget(system_hint)
 
-        # Option 2: OAuth (Claude subscription)
-        self.radio_oauth = QRadioButton("Claude account (Pro, Max, Team, or Enterprise)")
-        self.radio_oauth.setStyleSheet(f"QRadioButton {{ color: {colors['text']}; }}")
-        self.auth_group.addButton(self.radio_oauth, 1)
-        layout.addWidget(self.radio_oauth)
-
-        # Option 3: API Key (Anthropic Console)
-        self.radio_api_key = QRadioButton("Anthropic Console account (API billing)")
+        # Option 2: API key/token
+        self.radio_api_key = QRadioButton("Use API key / token")
         self.radio_api_key.setStyleSheet(f"QRadioButton {{ color: {colors['text']}; }}")
-        self.auth_group.addButton(self.radio_api_key, 2)
+        self.auth_group.addButton(self.radio_api_key, 1)
         layout.addWidget(self.radio_api_key)
 
-        # Key input field (hidden for system option)
+        # Key input field (hidden for Claude+system)
         self.key_input = QLineEdit()
         self.key_input.setPlaceholderText("Paste your key here...")
         self.key_input.setEchoMode(QLineEdit.Password)
@@ -1014,11 +1193,24 @@ class OnboardingPanel(QFrame):
                 border-color: {colors['highlight']};
             }}
         """)
-        self.key_input.hide()  # Hidden by default (system option selected)
+        self.key_input.hide()
         layout.addWidget(self.key_input)
 
-        # Connect radio buttons to show/hide key input
+        # Model picker (editable, Copilot-style)
+        self.model_combo = QComboBox()
+        self.model_combo.setEditable(True)
+        self.model_combo.setStyleSheet(self.key_input.styleSheet())
+        layout.addWidget(self.model_combo)
+
+        # Optional base URL override
+        self.base_url_input = QLineEdit()
+        self.base_url_input.setPlaceholderText("Optional base URL override")
+        self.base_url_input.setStyleSheet(self.key_input.styleSheet())
+        layout.addWidget(self.base_url_input)
+
+        # Connect controls
         self.auth_group.buttonClicked.connect(self._on_auth_type_changed)
+        self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
 
         # Buttons row
         buttons_layout = QHBoxLayout()
@@ -1089,32 +1281,115 @@ class OnboardingPanel(QFrame):
         layout.addStretch()
 
         main_layout.addWidget(settings_container, stretch=70)
+        self._refresh_provider_fields()
 
-    def _on_auth_type_changed(self, button):
-        """Show/hide key input based on selected auth type."""
-        if button == self.radio_system:
+    def _get_selected_provider(self) -> str:
+        value = self.provider_combo.currentData()
+        return normalize_provider(value if isinstance(value, str) else "claude")
+
+    def _get_auth_mode(self) -> str:
+        provider = self._get_selected_provider()
+        if provider == "claude" and self.radio_system.isChecked():
+            return "system"
+        return "api_key"
+
+    def _refresh_provider_fields(self):
+        """Update placeholders and auth controls for selected provider."""
+        provider = self._get_selected_provider()
+
+        self.provider_note.setText(provider_free_tier_note(provider))
+
+        model_hint = provider_default_model(provider)
+        current_model = self.model_combo.currentText().strip()
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        self.model_combo.addItem("")
+        for model_name in provider_recommended_models(provider):
+            self.model_combo.addItem(model_name)
+        if model_hint and model_hint not in {self.model_combo.itemText(i) for i in range(self.model_combo.count())}:
+            self.model_combo.addItem(model_hint)
+        if current_model:
+            self.model_combo.setCurrentText(current_model)
+        elif model_hint:
+            self.model_combo.setCurrentText(model_hint)
+        self.model_combo.setEditable(True)
+        self.model_combo.blockSignals(False)
+
+        base_hint = provider_default_base_url(provider)
+        if base_hint:
+            self.base_url_input.setPlaceholderText(f"Optional base URL override (default: {base_hint})")
+        else:
+            self.base_url_input.setPlaceholderText("Optional base URL override")
+
+        self.key_input.setPlaceholderText(provider_key_hint(provider))
+
+        if provider == "claude":
+            self.radio_system.setEnabled(True)
+        else:
+            self.radio_system.setEnabled(False)
+            self.radio_api_key.setChecked(True)
+
+        if provider == "claude" and self.radio_system.isChecked():
             self.key_input.hide()
         else:
             self.key_input.show()
 
+    def _on_provider_changed(self, _index: int):
+        provider = self._get_selected_provider()
+        cfg = get_provider_config(provider)
+
+        if provider == "claude" and cfg.auth_mode == "system":
+            self.radio_system.setChecked(True)
+        else:
+            self.radio_api_key.setChecked(True)
+
+        self.key_input.setText(cfg.api_key or "")
+        self.base_url_input.setText(cfg.base_url or "")
+        self._refresh_provider_fields()
+        self.model_combo.setCurrentText(cfg.model or resolve_model(cfg) or "")
+
+    def _on_auth_type_changed(self, _button):
+        self._refresh_provider_fields()
+
+    def _get_provider_config_from_ui(self) -> ProviderConfig:
+        auth_mode = self._get_auth_mode()
+        api_key = self.key_input.text().strip() or None
+        if auth_mode == "system":
+            api_key = None
+
+        return ProviderConfig(
+            provider=self._get_selected_provider(),
+            auth_mode=auth_mode,
+            api_key=api_key,
+            model=self.model_combo.currentText().strip() or None,
+            base_url=self.base_url_input.text().strip() or None,
+        )
+
     def _on_test_clicked(self):
         """Run connection test."""
+        config = self._get_provider_config_from_ui()
+        ok, error = validate_provider_config(config)
+        if not ok:
+            self.status_label.setText(error)
+            self.status_label.setStyleSheet("QLabel { color: #F44336; }")
+            self.response_label.hide()
+            return
+
         self.test_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
         self.status_label.setText("Testing connection...")
         self.response_label.hide()
 
         # Apply settings to environment before testing
-        self._apply_current_settings()
+        self._apply_current_settings(config)
 
         # Start test worker
-        self._test_worker = TestConnectionWorker(self)
+        self._test_worker = TestConnectionWorker(config, self)
         self._test_worker.finished.connect(self._on_test_finished)
         self._test_worker.start()
 
     def _on_test_finished(self, success: bool, message: str):
         """Handle test result."""
-        colors = get_ida_colors()
         self.test_btn.setEnabled(True)
         self.save_btn.setEnabled(True)
 
@@ -1128,66 +1403,48 @@ class OnboardingPanel(QFrame):
             self.status_label.setStyleSheet(f"QLabel {{ color: #F44336; }}")  # Red
             self.response_label.hide()
 
-    def _apply_current_settings(self):
+    def _apply_current_settings(self, config: ProviderConfig | None = None):
         """Apply current UI settings to environment variables."""
-        auth_type = self._get_auth_type()
-        api_key = self.key_input.text().strip() if auth_type != "system" else None
-
-        if auth_type == "system":
-            pass  # Use existing system configuration
-        elif auth_type == "oauth" and api_key:
-            os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = api_key
-        elif auth_type == "api_key" and api_key:
-            os.environ["ANTHROPIC_API_KEY"] = api_key
-
-    def _get_auth_type(self) -> str:
-        """Get the selected auth type."""
-        if self.radio_system.isChecked():
-            return "system"
-        elif self.radio_oauth.isChecked():
-            return "oauth"
-        else:
-            return "api_key"
+        apply_provider_environment(config or self._get_provider_config_from_ui())
 
     def _on_save_clicked(self):
         """Save settings and emit completion signal."""
-        auth_type = self._get_auth_type()
-        api_key = self.key_input.text().strip() if auth_type != "system" else None
-
-        # Validate key input for non-system auth types
-        if auth_type != "system" and not api_key:
-            colors = get_ida_colors()
-            self.status_label.setText("Please enter your API key")
+        config = self._get_provider_config_from_ui()
+        ok, error = validate_provider_config(config)
+        if not ok:
+            self.status_label.setText(error)
             self.status_label.setStyleSheet(f"QLabel {{ color: #F44336; }}")
             return
 
         # Save settings
-        save_auth_settings(auth_type, api_key)
+        save_provider_settings(config)
 
         # Apply to environment
-        self._apply_current_settings()
+        self._apply_current_settings(config)
 
         # Emit completion signal
         self.onboarding_complete.emit()
 
     def load_current_settings(self):
         """Load current settings into the UI (for settings mode)."""
-        auth_type = get_auth_type()
-        api_key = get_api_key()
+        config = get_provider_config()
 
-        if auth_type == "system":
+        for i in range(self.provider_combo.count()):
+            data = self.provider_combo.itemData(i)
+            if isinstance(data, str) and normalize_provider(data) == normalize_provider(config.provider):
+                self.provider_combo.setCurrentIndex(i)
+                break
+
+        if normalize_provider(config.provider) == "claude" and config.auth_mode == "system":
             self.radio_system.setChecked(True)
-            self.key_input.hide()
-        elif auth_type == "oauth":
-            self.radio_oauth.setChecked(True)
-            self.key_input.show()
-            if api_key:
-                self.key_input.setText(api_key)
-        elif auth_type == "api_key":
+        else:
             self.radio_api_key.setChecked(True)
-            self.key_input.show()
-            if api_key:
-                self.key_input.setText(api_key)
+
+        self.key_input.setText(config.api_key or "")
+        self.base_url_input.setText(config.base_url or "")
+
+        self._refresh_provider_fields()
+        self.model_combo.setCurrentText(config.model or resolve_model(config) or "")
 
         # Reset status
         colors = get_ida_colors()
@@ -1211,7 +1468,8 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self._script_count = 0
         self._last_had_error = False
         self._message_count = 0
-        self._model_name = "Sonnet"  # Default Claude Code model
+        self._provider_config = get_provider_config()
+        self._model_name = describe_provider(self._provider_config)
 
         # Allow horizontal resizing (IDA remembers preferred size)
         self.parent.setMinimumWidth(600)
@@ -1220,7 +1478,8 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self._create_ui()
 
         # Apply saved auth settings to environment
-        apply_auth_to_environment()
+        self._provider_config = apply_auth_to_environment()
+        self._model_name = describe_provider(self._provider_config)
 
         # Check if wizard should be shown
         if get_show_wizard():
@@ -1257,13 +1516,28 @@ class IDAChatForm(ida_kernwin.PluginForm):
     def _init_agent(self):
         """Initialize the agent worker."""
         try:
+            # Reload provider settings in case they changed in onboarding.
+            self._provider_config = apply_auth_to_environment()
+            self._model_name = describe_provider(self._provider_config)
+            self._refresh_header_provider_controls()
+
             db = Database.open()
             script_executor = self._create_script_executor(db)
 
             # Create message history for this binary
             self.history = MessageHistory(db.path)
 
-            self.worker = AgentWorker(db, script_executor, self.history)
+            if self.worker:
+                self.worker.request_disconnect()
+                self.worker.wait(5000)
+                self.worker = None
+
+            self.worker = AgentWorker(
+                db,
+                script_executor,
+                self.history,
+                provider_config=self._provider_config,
+            )
 
             # Connect signals
             self.worker.signals.connection_ready.connect(self._on_connection_ready)
@@ -1283,6 +1557,87 @@ class IDAChatForm(ida_kernwin.PluginForm):
             self.worker.request_connect()
         except Exception as e:
             self.chat_history.add_message(f"Error initializing agent: {e}", is_user=False)
+
+    def _refresh_header_model_options(self, provider: str, selected_model: str | None = None):
+        """Populate the header model picker for the selected provider."""
+        provider = normalize_provider(provider)
+        models = provider_recommended_models(provider)
+        default_model = provider_default_model(provider)
+
+        current = selected_model or self.model_switch_combo.currentText().strip() or default_model or ""
+
+        self.model_switch_combo.blockSignals(True)
+        self.model_switch_combo.clear()
+        self.model_switch_combo.addItem("")
+        for model in models:
+            self.model_switch_combo.addItem(model)
+        if default_model and default_model not in {self.model_switch_combo.itemText(i) for i in range(self.model_switch_combo.count())}:
+            self.model_switch_combo.addItem(default_model)
+        if current:
+            self.model_switch_combo.setCurrentText(current)
+        self.model_switch_combo.setEditable(True)
+        self.model_switch_combo.blockSignals(False)
+
+    def _refresh_header_provider_controls(self):
+        """Sync header provider/model controls with persisted settings."""
+        active_provider = normalize_provider(self._provider_config.provider)
+
+        self.provider_switch_combo.blockSignals(True)
+        self.provider_switch_combo.clear()
+
+        provider_order = get_configured_providers()
+        for provider in SUPPORTED_PROVIDERS:
+            if provider not in provider_order:
+                provider_order.append(provider)
+
+        for provider in provider_order:
+            self.provider_switch_combo.addItem(provider_label(provider), provider)
+
+        for i in range(self.provider_switch_combo.count()):
+            data = self.provider_switch_combo.itemData(i)
+            if isinstance(data, str) and normalize_provider(data) == active_provider:
+                self.provider_switch_combo.setCurrentIndex(i)
+                break
+
+        self.provider_switch_combo.blockSignals(False)
+        self._refresh_header_model_options(
+            active_provider,
+            self._provider_config.model or resolve_model(self._provider_config),
+        )
+
+    def _on_header_provider_changed(self, _index: int):
+        """Refresh model options when provider selection changes in the header."""
+        value = self.provider_switch_combo.currentData()
+        provider = normalize_provider(value if isinstance(value, str) else "claude")
+        cfg = get_provider_config(provider)
+        self._refresh_header_model_options(provider, cfg.model or resolve_model(cfg))
+
+    def _on_apply_provider_switch(self):
+        """Apply provider/model switch from the header and reconnect the agent."""
+        if self._is_processing:
+            self.chat_history.add_message("Finish the current request before switching model/provider.", is_user=False)
+            return
+
+        provider_value = self.provider_switch_combo.currentData()
+        provider = normalize_provider(provider_value if isinstance(provider_value, str) else "claude")
+        previous = get_provider_config(provider)
+
+        switch_config = ProviderConfig(
+            provider=provider,
+            auth_mode=previous.auth_mode,
+            api_key=previous.api_key,
+            model=self.model_switch_combo.currentText().strip() or None,
+            base_url=previous.base_url,
+        )
+
+        ok, error = validate_provider_config(switch_config)
+        if not ok:
+            self.chat_history.add_message(f"Cannot switch provider: {error}", is_user=False)
+            return
+
+        save_provider_settings(switch_config)
+        self.chat_history.add_message(f"Switching to {describe_provider(switch_config)}...", is_user=False)
+        self._init_agent()
 
     def _show_onboarding(self):
         """Show onboarding panel, hide chat UI."""
@@ -1322,7 +1677,7 @@ class IDAChatForm(ida_kernwin.PluginForm):
 
     def _on_connection_ready(self):
         """Called when agent connection is established."""
-        self.chat_history.add_message("Agent connected and ready!", is_user=False)
+        self.chat_history.add_message(f"Agent connected and ready ({self._model_name}).", is_user=False)
         self.input_widget.setEnabled(True)
         self.input_widget.setFocus()
         self._update_status_bar()
@@ -1472,6 +1827,51 @@ class IDAChatForm(ida_kernwin.PluginForm):
             }}
         """)
         header_layout.addWidget(title)
+
+        combo_style = f"""
+            QComboBox {{
+                background-color: {colors['alt_base']};
+                color: {colors['text']};
+                border: 1px solid {colors['mid']};
+                border-radius: 4px;
+                padding: 2px 6px;
+                min-height: 22px;
+            }}
+            QComboBox::drop-down {{
+                border: none;
+            }}
+        """
+
+        self.provider_switch_combo = QComboBox()
+        self.provider_switch_combo.setStyleSheet(combo_style)
+        self.provider_switch_combo.setMinimumWidth(150)
+        self.provider_switch_combo.currentIndexChanged.connect(self._on_header_provider_changed)
+        header_layout.addWidget(self.provider_switch_combo)
+
+        self.model_switch_combo = QComboBox()
+        self.model_switch_combo.setEditable(True)
+        self.model_switch_combo.setStyleSheet(combo_style)
+        self.model_switch_combo.setMinimumWidth(220)
+        header_layout.addWidget(self.model_switch_combo)
+
+        self.switch_model_btn = QPushButton("Apply")
+        self.switch_model_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {colors['button']};
+                color: {colors['button_text']};
+                border: 1px solid {colors['mid']};
+                border-radius: 4px;
+                padding: 2px 8px;
+                min-height: 22px;
+            }}
+            QPushButton:hover {{
+                background-color: {colors['highlight']};
+                color: {colors['highlight_text']};
+            }}
+        """)
+        self.switch_model_btn.clicked.connect(self._on_apply_provider_switch)
+        header_layout.addWidget(self.switch_model_btn)
+
         header_layout.addStretch()
 
         # Icon button style (shared)
@@ -1561,14 +1961,15 @@ class IDAChatForm(ida_kernwin.PluginForm):
 
         self.parent.setLayout(layout)
 
+        # Initialize provider/model picker controls.
+        self._refresh_header_provider_controls()
+
         # Add welcome message
         self._add_welcome_message()
 
     def _add_welcome_message(self):
         """Add a welcome message to the chat."""
-        welcome_text = (
-            "Welcome to IDA Chat! Connecting to Claude Agent SDK..."
-        )
+        welcome_text = f"Welcome to IDA Chat! Preparing {self._model_name}..."
         self.chat_history.add_message(welcome_text, is_user=False)
         # Disable input until agent is connected
         self.input_widget.setEnabled(False)

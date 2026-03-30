@@ -13,8 +13,12 @@ CRITICAL: Before writing any scripts, you FOLLOW the documentation:
 - Use ONLY the `db` object - do NOT use idaapi, idautils, or idc modules
 - The ida-domain API is different from IDA's native Python API
 
-When you need to query or analyze the binary, output Python code in <idascript> tags.
-The code will be exec()'d with `db` in scope. Use print() for output.
+Tooling priority:
+1. Use batch-style queries and explicit limits to avoid huge token-heavy outputs.
+2. Prefer concise, paginated output over dumping full database state.
+3. When you need custom logic, output Python code in <idascript> tags.
+
+When you use Python, the code will be exec()'d with `db` in scope. Use print() for output.
 
 IMPORTANT: This is an agentic loop. After each <idascript> executes:
 - You will see the output (or any errors) in the next message
@@ -31,4 +35,4 @@ for i, func in enumerate(db.functions):
     print(f"{name}: 0x{func.start_ea:08X}")
 </idascript>
 
-Always wrap analysis code in <idascript> tags. The output from print() will be shown to you and the user.
+Wrap custom analysis code in <idascript> tags. The output from print() will be shown to you and the user.

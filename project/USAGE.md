@@ -8,6 +8,9 @@ This document describes how to write scripts for the IDA Chat plugin using the i
 
 Scripts have access to an open IDA database via the `db` variable. Use `print()` to output results.
 
+Prefer batch-style scripts with explicit limits for large results. This keeps responses fast,
+reduces token overhead, and improves reliability on large binaries.
+
 ## Common Patterns
 
 ### List All Functions

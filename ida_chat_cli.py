@@ -2,6 +2,8 @@
 """
 IDA Chat CLI - Command-line chat interface for IDA Pro.
 
+Provider/model configuration is managed in the IDA plugin UI.
+
 Usage:
     ida-chat <binary.i64>              # Interactive mode
     ida-chat <binary.i64> -p "prompt"  # Single prompt mode
@@ -25,8 +27,6 @@ sys.path.insert(0, str(Path(__file__).parent.resolve()))
 # Import local module first (before ida_domain which may modify sys.path)
 from ida_chat_core import IDAChatCore, ChatCallback
 from ida_chat_history import MessageHistory
-
-from ida_domain import Database
 
 
 # ANSI colors for terminal output
@@ -93,6 +93,8 @@ class IDAChat:
 
     async def start(self) -> None:
         """Open database and initialize the agent."""
+        from ida_domain import Database
+
         print(f"Opening database: {self.binary_path}")
         self.db = Database.open(str(self.binary_path))
         print(f"Database opened: {self.db.module}")
@@ -101,7 +103,11 @@ class IDAChat:
         print()
 
         callback = CLICallback()
-        self.core = IDAChatCore(self.db, callback, verbose=self.verbose)
+        self.core = IDAChatCore(
+            self.db,
+            callback,
+            verbose=self.verbose,
+        )
         await self.core.connect()
 
     async def stop(self, save: bool = False) -> None:
@@ -334,7 +340,7 @@ def run_transcript_command(args: list[str]) -> int:
 
 async def async_main():
     parser = argparse.ArgumentParser(
-        description="Chat interface for IDA Pro using Claude Agent SDK"
+        description="Chat interface for IDA Pro using Claude Agent SDK with multi-provider support"
     )
     parser.add_argument("binary", help="Path to binary or .i64 file")
     parser.add_argument("-p", "--prompt", help="Single prompt (non-interactive mode)")

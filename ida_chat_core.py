@@ -41,6 +41,13 @@ from claude_agent_sdk import (
     ResultMessage,
 )
 
+from ida_chat_provider import (
+    ProviderConfig,
+    build_provider_env,
+    normalize_provider,
+    resolve_model,
+)
+
 
 # Project directory for agent SDK (contains PROMPT.md, USAGE.md, API_REFERENCE.md)
 PROJECT_DIR = Path(__file__).parent.resolve() / "project"
@@ -53,6 +60,27 @@ PROMPT_FILE = PROJECT_DIR / "PROMPT.md"
 IDA_UI_FILE = PROJECT_DIR / "IDA.md"
 USAGE_FILE = PROJECT_DIR / "USAGE.md"
 API_REFERENCE_FILE = PROJECT_DIR / "API_REFERENCE.md"
+
+DEFAULT_BUILTIN_TOOLS = {
+    "type": "preset",
+    "preset": "claude_code",
+}
+
+FILE_ACCESS_TOOL_MATCHER = "Read|Write|Edit|MultiEdit|Glob|Grep"
+PATH_KEY_HINTS = {
+    "path",
+    "file_path",
+    "file",
+    "old_path",
+    "new_path",
+    "directory",
+    "cwd",
+    "include",
+}
+PATH_LIST_KEY_HINTS = {
+    "paths",
+    "file_paths",
+}
 
 
 def _load_system_prompt() -> str:
@@ -82,26 +110,72 @@ def _load_system_prompt() -> str:
     return prompt
 
 
+def _iter_candidate_paths(tool_input: dict) -> list[str]:
+    """Collect path-like values from tool input dictionaries."""
+    candidates: list[str] = []
+
+    for key, value in tool_input.items():
+        key_lower = key.lower()
+        if key_lower in PATH_KEY_HINTS and isinstance(value, str):
+            candidates.append(value)
+        elif key_lower in PATH_LIST_KEY_HINTS and isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    candidates.append(item)
+
+    return candidates
+
+
+def _normalize_candidate_path(raw_path: str) -> Path | None:
+    """Convert a raw path-ish value to a resolved path for policy checks."""
+    value = raw_path.strip()
+    if not value:
+        return None
+
+    # Ignore non-file URLs (e.g., http/https) for file policy checks.
+    if "://" in value and not value.startswith("file://"):
+        return None
+    if value.startswith("file://"):
+        value = value[7:]
+
+    # If this looks like a glob, validate its static prefix.
+    wildcard_positions = [value.find(ch) for ch in ("*", "?", "[") if ch in value]
+    if wildcard_positions:
+        prefix = value[: min(wildcard_positions)]
+        value = prefix if prefix else "."
+
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_DIR / path
+
+    return path.resolve()
+
+
 async def _restrict_file_access(input_data, tool_use_id, context):
     """Hook to block file operations outside PROJECT_DIR."""
     if input_data['hook_event_name'] != 'PreToolUse':
         return {}
 
+    tool_name = input_data.get('tool_name', 'unknown')
     tool_input = input_data['tool_input']
+    if not isinstance(tool_input, dict):
+        return {}
 
-    # Get the path being accessed (different tools use different param names)
-    file_path = tool_input.get('file_path') or tool_input.get('path') or ''
+    candidate_paths = _iter_candidate_paths(tool_input)
 
-    if file_path:
-        # Resolve to absolute path
-        resolved = Path(file_path).resolve()
+    for file_path in candidate_paths:
+        resolved = _normalize_candidate_path(file_path)
+        if resolved is None:
+            continue
 
-        # Check if it's inside PROJECT_DIR
         try:
             resolved.relative_to(PROJECT_DIR)
         except ValueError:
-            # Path is outside PROJECT_DIR
-            logger.warning(f"Blocked file access outside PROJECT_DIR: {file_path}")
+            logger.warning(
+                "Blocked %s file access outside PROJECT_DIR: %s",
+                tool_name,
+                file_path,
+            )
             return {
                 'hookSpecificOutput': {
                     'hookEventName': input_data['hook_event_name'],
@@ -171,29 +245,32 @@ def export_transcript_to_dir(session_file: Path, output_dir: Path) -> Path:
     return output_dir / "index.html"
 
 
-async def test_claude_connection() -> tuple[bool, str]:
-    """Test Claude connectivity with a fun prompt.
+async def test_provider_connection(provider_config: ProviderConfig) -> tuple[bool, str]:
+    """Test provider connectivity with a lightweight prompt.
 
     This is a lightweight test that doesn't require a database or full
     agent configuration. Used by the onboarding panel to verify setup.
 
     Returns:
         Tuple of (success, message):
-        - On success: (True, Claude's joke response)
+        - On success: (True, provider response)
         - On failure: (False, error message)
     """
-    logger.info("Testing Claude connection...")
+    provider_name = normalize_provider(provider_config.provider)
+    logger.info("Testing provider connection: %s", provider_name)
 
     options = ClaudeAgentOptions(
         cwd=str(PROJECT_DIR),
         permission_mode="bypassPermissions",
         allowed_tools=[],  # No tools needed for simple test
+        env=build_provider_env(provider_config),
+        model=resolve_model(provider_config),
     )
 
     client = ClaudeSDKClient(options=options)
     try:
         await client.connect()
-        await client.query("Tell me a short (one sentence) joke about reverse engineering")
+        await client.query("Reply with one short sentence saying the connection is working")
 
         response_text = ""
         async for message in client.receive_response():
@@ -203,11 +280,11 @@ async def test_claude_connection() -> tuple[bool, str]:
                         response_text += block.text
 
         await client.disconnect()
-        logger.info(f"Connection test successful: {response_text[:100]}...")
+        logger.info("Provider connection test successful: %s", provider_name)
         return True, response_text.strip()
 
     except Exception as e:
-        logger.error(f"Connection test failed: {e}")
+        logger.error("Connection test failed for provider %s: %s", provider_name, e)
         return False, str(e)
 
 
@@ -270,6 +347,7 @@ class IDAChatCore:
         script_executor: Callable[[str], str] | None = None,
         verbose: bool = False,
         max_turns: int = 20,
+        provider_config: ProviderConfig | None = None,
         history: "MessageHistory | None" = None,
     ):
         """Initialize the chat core.
@@ -282,12 +360,14 @@ class IDAChatCore:
                 executor that runs on the main thread.
             verbose: If True, report additional stats.
             max_turns: Maximum agentic turns before stopping (default 20).
+            provider_config: Provider/backend configuration.
             history: Optional MessageHistory for persisting conversations.
         """
         self.db = db
         self.callback = callback
         self.verbose = verbose
         self.max_turns = max_turns
+        self.provider_config = provider_config or ProviderConfig()
         self.history = history
         self.client: ClaudeSDKClient | None = None
         self._cancelled = False
@@ -301,15 +381,24 @@ class IDAChatCore:
 
     async def connect(self) -> None:
         """Initialize and connect the Agent SDK client."""
+        provider_name = normalize_provider(self.provider_config.provider)
+        selected_model = resolve_model(self.provider_config)
+
         logger.info("=" * 60)
-        logger.info("Connecting to Claude Agent SDK")
+        logger.info("Connecting to agent backend via Claude Agent SDK")
+        logger.info("Provider: %s", provider_name)
+        if selected_model:
+            logger.info("Model override: %s", selected_model)
         logger.info(f"CWD: {PROJECT_DIR}")
 
         options = ClaudeAgentOptions(
             cwd=str(PROJECT_DIR),
             setting_sources=["project"],
-            allowed_tools=["Read", "Glob", "Grep", "Task"],
+            tools=DEFAULT_BUILTIN_TOOLS,
+            disallowed_tools=["Bash"],
             permission_mode="bypassPermissions",
+            env=build_provider_env(self.provider_config),
+            model=selected_model,
             system_prompt={
                 "type": "preset",
                 "preset": "claude_code",
@@ -317,7 +406,7 @@ class IDAChatCore:
             },
             hooks={
                 'PreToolUse': [
-                    HookMatcher(matcher='Read|Glob|Grep', hooks=[_restrict_file_access])
+                    HookMatcher(matcher=FILE_ACCESS_TOOL_MATCHER, hooks=[_restrict_file_access])
                 ]
             },
         )

@@ -105,9 +105,9 @@ The plugin must be packaged as a zip and installed via `hcli`. **Close IDA befor
 ```bash
 # Redeploy plugin (uninstall old, install new)
 rm -f ida-chat.zip && \
-zip -r ida-chat.zip ida-plugin.json ida_chat_plugin.py ida_chat_core.py ida_chat_history.py splash.png project/ && \
+zip -r ida-chat.zip ida-plugin.json ida_chat_plugin.py ida_chat_core.py ida_chat_history.py ida_chat_provider.py splash.png project/ && \
 hcli plugin uninstall ida-chat && \
-hcli plugin install ida-chat.zip --config show_wizard=true --config auth_type=system --config api_key=
+hcli plugin install ida-chat.zip --config show_wizard=true
 ```
 
 **Files included in the plugin zip:**
@@ -122,7 +122,7 @@ hcli plugin install ida-chat.zip --config show_wizard=true --config auth_type=sy
 
 ```bash
 # Build the release zip
-zip -r ida-chat.zip ida-plugin.json ida_chat_plugin.py ida_chat_core.py ida_chat_history.py project/
+zip -r ida-chat.zip ida-plugin.json ida_chat_plugin.py ida_chat_core.py ida_chat_history.py ida_chat_provider.py project/
 
 # Create and push the tag
 git tag -a X.Y.Z -m "Release message"
