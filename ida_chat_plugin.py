@@ -57,6 +57,7 @@ from ida_chat_provider import (
     provider_key_hint,
     provider_label,
     provider_recommended_models,
+    requires_api_key,
     resolve_model,
     validate_provider_config,
 )
@@ -222,7 +223,7 @@ def get_provider_config(provider: str | None = None) -> ProviderConfig:
     profile = profiles.get(active_provider, {})
     auth_mode = str(profile.get("auth_mode", "")).lower()
     if auth_mode not in {"system", "api_key"}:
-        auth_mode = "system" if active_provider == "claude" else "api_key"
+        auth_mode = "api_key"
     if active_provider != "claude" and auth_mode == "system":
         auth_mode = "api_key"
 
@@ -235,20 +236,34 @@ def get_provider_config(provider: str | None = None) -> ProviderConfig:
     )
 
 
+def _is_provider_config_complete(config: ProviderConfig) -> bool:
+    provider = normalize_provider(config.provider)
+    api_key_present = bool((config.api_key or "").strip())
+
+    if provider == "claude":
+        return config.auth_mode == "system" or api_key_present
+
+    if provider == "ollama":
+        # Local Ollama can be keyless.
+        return True
+
+    return api_key_present
+
+
+def has_configured_provider() -> bool:
+    """True when at least one provider has a usable saved configuration."""
+    # Trigger one-time migration from legacy flat settings when available.
+    get_provider_config()
+    return any(_is_provider_config_complete(get_provider_config(provider)) for provider in SUPPORTED_PROVIDERS)
+
+
 def get_configured_providers() -> list[str]:
     """Return providers that have saved profiles, preserving known order."""
-    profiles = _load_provider_profiles()
-    active = normalize_provider(_get_setting_str("provider"))
-
-    configured = [provider for provider in SUPPORTED_PROVIDERS if provider in profiles]
-    if active not in configured:
-        configured.insert(0, active)
-
-    deduped: list[str] = []
-    for provider in configured:
-        if provider not in deduped:
-            deduped.append(provider)
-    return deduped
+    configured: list[str] = []
+    for provider in SUPPORTED_PROVIDERS:
+        if _is_provider_config_complete(get_provider_config(provider)):
+            configured.append(provider)
+    return configured
 
 
 def save_provider_settings(config: ProviderConfig) -> None:
@@ -1212,6 +1227,7 @@ class OnboardingPanel(QFrame):
         # Connect controls
         self.auth_group.buttonClicked.connect(self._on_auth_type_changed)
         self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
+        self.key_input.textChanged.connect(lambda _text: self._update_model_edit_state())
 
         # Buttons row
         buttons_layout = QHBoxLayout()
@@ -1286,7 +1302,14 @@ class OnboardingPanel(QFrame):
 
     def _get_selected_provider(self) -> str:
         value = self.provider_combo.currentData()
-        return normalize_provider(value if isinstance(value, str) else "claude")
+        if isinstance(value, str) and value:
+            return normalize_provider(value)
+
+        fallback = self.provider_combo.itemData(0)
+        if isinstance(fallback, str) and fallback:
+            return normalize_provider(fallback)
+
+        return normalize_provider(SUPPORTED_PROVIDERS[0])
 
     def _get_auth_mode(self) -> str:
         provider = self._get_selected_provider()
@@ -1335,6 +1358,8 @@ class OnboardingPanel(QFrame):
         else:
             self.key_input.show()
 
+        self._update_model_edit_state()
+
     def _on_provider_changed(self, _index: int):
         provider = self._get_selected_provider()
         cfg = get_provider_config(provider)
@@ -1351,6 +1376,17 @@ class OnboardingPanel(QFrame):
 
     def _on_auth_type_changed(self, _button):
         self._refresh_provider_fields()
+
+    def _update_model_edit_state(self):
+        """Enable model picker only when selected provider auth is configured."""
+        cfg = self._get_provider_config_from_ui()
+        model_enabled = not requires_api_key(cfg) or bool((cfg.api_key or "").strip())
+        self.model_combo.setEnabled(model_enabled)
+
+        if model_enabled:
+            self.model_combo.setToolTip("")
+        else:
+            self.model_combo.setToolTip("Configure provider credentials first to enable model selection")
 
     def _get_provider_config_from_ui(self) -> ProviderConfig:
         auth_mode = self._get_auth_mode()
@@ -1446,6 +1482,7 @@ class OnboardingPanel(QFrame):
 
         self._refresh_provider_fields()
         self.model_combo.setCurrentText(config.model or resolve_model(config) or "")
+        self._update_model_edit_state()
 
         # Reset status
         colors = get_ida_colors()
@@ -1482,8 +1519,8 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self._provider_config = apply_auth_to_environment()
         self._model_name = describe_provider(self._provider_config)
 
-        # Check if wizard should be shown
-        if get_show_wizard():
+        # Require onboarding until at least one provider is fully configured.
+        if get_show_wizard() or not has_configured_provider():
             self._show_onboarding()
         else:
             self._init_agent()
@@ -1587,12 +1624,22 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self.provider_switch_combo.clear()
 
         provider_order = get_configured_providers()
-        for provider in SUPPORTED_PROVIDERS:
-            if provider not in provider_order:
-                provider_order.append(provider)
+
+        if not provider_order:
+            self.provider_switch_combo.addItem("Configure Provider", "")
+            self.provider_switch_combo.setEnabled(False)
+            self.model_switch_combo.clear()
+            self.model_switch_combo.setEnabled(False)
+            self.switch_model_btn.setEnabled(False)
+            self.provider_switch_combo.blockSignals(False)
+            return
 
         for provider in provider_order:
             self.provider_switch_combo.addItem(provider_label(provider), provider)
+
+        self.provider_switch_combo.setEnabled(True)
+        self.model_switch_combo.setEnabled(True)
+        self.switch_model_btn.setEnabled(True)
 
         for i in range(self.provider_switch_combo.count()):
             data = self.provider_switch_combo.itemData(i)
@@ -1600,16 +1647,30 @@ class IDAChatForm(ida_kernwin.PluginForm):
                 self.provider_switch_combo.setCurrentIndex(i)
                 break
 
+        selected_value = self.provider_switch_combo.currentData()
+        selected_provider = normalize_provider(
+            selected_value if isinstance(selected_value, str) and selected_value else provider_order[0]
+        )
+        selected_config = get_provider_config(selected_provider)
+
         self.provider_switch_combo.blockSignals(False)
         self._refresh_header_model_options(
-            active_provider,
-            self._provider_config.model or resolve_model(self._provider_config),
+            selected_provider,
+            selected_config.model or resolve_model(selected_config),
         )
 
     def _on_header_provider_changed(self, _index: int):
         """Refresh model options when provider selection changes in the header."""
         value = self.provider_switch_combo.currentData()
-        provider = normalize_provider(value if isinstance(value, str) else "claude")
+        if not isinstance(value, str) or not value:
+            self.model_switch_combo.clear()
+            self.model_switch_combo.setEnabled(False)
+            self.switch_model_btn.setEnabled(False)
+            return
+
+        self.model_switch_combo.setEnabled(True)
+        self.switch_model_btn.setEnabled(True)
+        provider = normalize_provider(value)
         cfg = get_provider_config(provider)
         self._refresh_header_model_options(provider, cfg.model or resolve_model(cfg))
 
@@ -1620,8 +1681,16 @@ class IDAChatForm(ida_kernwin.PluginForm):
             return
 
         provider_value = self.provider_switch_combo.currentData()
-        provider = normalize_provider(provider_value if isinstance(provider_value, str) else "claude")
+        if not isinstance(provider_value, str) or not provider_value:
+            self.chat_history.add_message("Configure a provider in Settings first.", is_user=False)
+            return
+
+        provider = normalize_provider(provider_value)
         previous = get_provider_config(provider)
+
+        if not _is_provider_config_complete(previous):
+            self.chat_history.add_message("Selected provider is not configured. Open Settings to configure it first.", is_user=False)
+            return
 
         switch_config = ProviderConfig(
             provider=provider,

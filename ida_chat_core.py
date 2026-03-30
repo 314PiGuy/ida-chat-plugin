@@ -259,12 +259,20 @@ async def test_provider_connection(provider_config: ProviderConfig) -> tuple[boo
     provider_name = normalize_provider(provider_config.provider)
     logger.info("Testing provider connection: %s", provider_name)
 
+    stderr_lines: list[str] = []
+
+    def _collect_stderr(line: str) -> None:
+        text = line.rstrip()
+        if text:
+            stderr_lines.append(text)
+
     options = ClaudeAgentOptions(
         cwd=str(PROJECT_DIR),
         permission_mode="bypassPermissions",
         allowed_tools=[],  # No tools needed for simple test
         env=build_provider_env(provider_config),
         model=resolve_model(provider_config),
+        stderr=_collect_stderr,
     )
 
     client = ClaudeSDKClient(options=options)
@@ -285,7 +293,13 @@ async def test_provider_connection(provider_config: ProviderConfig) -> tuple[boo
 
     except Exception as e:
         logger.error("Connection test failed for provider %s: %s", provider_name, e)
-        return False, str(e)
+        err = str(e).strip() or "Unknown error"
+
+        if stderr_lines:
+            stderr_excerpt = "\n".join(stderr_lines[-12:])
+            return False, f"{err}\n\nSDK stderr:\n{stderr_excerpt}"
+
+        return False, err
 
 
 class ChatCallback(Protocol):

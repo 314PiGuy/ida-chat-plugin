@@ -40,6 +40,7 @@
         "name": "Provider Profiles",
         "type": "string",
         "description": "Internal JSON storage for provider credentials and model preferences",
+        "default": "{}",
         "sensitive": true,
         "required": false,
         "prompt": false
@@ -87,6 +88,7 @@
         "name": "Legacy Authentication Type",
         "type": "string",
         "description": "Legacy compatibility setting from older plugin versions",
+        "default": "system",
         "required": false,
         "prompt": false
       }

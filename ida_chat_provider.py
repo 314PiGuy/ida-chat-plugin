@@ -38,7 +38,7 @@ PROVIDER_DEFAULT_MODELS: dict[str, str | None] = {
     "openai": "gpt-4.1-mini",
     "openrouter": "google/gemini-2.5-flash-lite-preview:free",
     "ollama": "qwen2.5-coder:7b",
-    "nim": "meta/llama-3.1-70b-instruct",
+    "nim": "meta/llama-3.1-8b-instruct",
 }
 
 PROVIDER_RECOMMENDED_MODELS: dict[str, list[str]] = {
@@ -68,8 +68,8 @@ PROVIDER_RECOMMENDED_MODELS: dict[str, list[str]] = {
         "llama3.1:8b",
     ],
     "nim": [
-        "meta/llama-3.1-70b-instruct",
         "meta/llama-3.1-8b-instruct",
+        "meta/llama-3.1-70b-instruct",
         "mistralai/mixtral-8x7b-instruct-v0.1",
     ],
 }
@@ -120,7 +120,7 @@ MANAGED_ENV_KEYS = {
 @dataclass
 class ProviderConfig:
     provider: str = "claude"
-    auth_mode: str = "system"  # system | api_key
+    auth_mode: str = "api_key"  # system | api_key
     api_key: str | None = None
     model: str | None = None
     base_url: str | None = None
