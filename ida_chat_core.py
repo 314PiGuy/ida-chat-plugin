@@ -5,12 +5,16 @@ This module contains the common Agent SDK integration, script execution,
 and message processing used by both the CLI and IDA plugin.
 """
 
+import asyncio
+import json
 import logging
 import os
 import re
 import shutil
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from io import StringIO
 from pathlib import Path
 from typing import Callable, Protocol, TYPE_CHECKING
@@ -45,6 +49,8 @@ from ida_chat_provider import (
     ProviderConfig,
     build_provider_env,
     normalize_provider,
+    provider_label,
+    resolve_base_url,
     resolve_model,
 )
 
@@ -82,6 +88,14 @@ PATH_LIST_KEY_HINTS = {
     "file_paths",
 }
 
+OPENAI_COMPAT_DEFAULT_BASE_URLS = {
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "openai": "https://api.openai.com/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "ollama": "http://127.0.0.1:11434/v1",
+    "nim": "https://integrate.api.nvidia.com/v1",
+}
+
 
 def _load_system_prompt() -> str:
     """Load the system prompt from PROMPT.md.
@@ -108,6 +122,186 @@ def _load_system_prompt() -> str:
     prompt += "\n\n" + USAGE_FILE.read_text(encoding="utf-8")
     prompt += "\n\n" + API_REFERENCE_FILE.read_text(encoding="utf-8")
     return prompt
+
+
+def _normalize_openai_compat_endpoint(base_url: str) -> str:
+    """Normalize base URLs to a chat completions endpoint."""
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/chat/completions"):
+        return normalized
+    return normalized + "/chat/completions"
+
+
+def _extract_error_message(response_body: str) -> str:
+    """Extract best-effort API error text from a JSON response body."""
+    text = response_body.strip()
+    if not text:
+        return "Unknown error"
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+    if isinstance(payload, dict):
+        error_obj = payload.get("error")
+        if isinstance(error_obj, dict):
+            for key in ("message", "detail", "code"):
+                value = error_obj.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        if isinstance(error_obj, str) and error_obj.strip():
+            return error_obj.strip()
+
+        message = payload.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+
+    return text
+
+
+def _extract_openai_compat_text(payload: dict) -> str:
+    """Extract assistant text from OpenAI-compatible chat completion payloads."""
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError("Provider response did not include any choices")
+
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        raise RuntimeError("Provider response choice format is invalid")
+
+    message = first_choice.get("message")
+    if not isinstance(message, dict):
+        raise RuntimeError("Provider response did not include a message block")
+
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+
+    # Some providers can return structured content parts.
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+        return "".join(parts)
+
+    if content is None:
+        return ""
+
+    return str(content)
+
+
+def _build_openai_compat_headers(provider_config: ProviderConfig) -> dict[str, str]:
+    """Build HTTP headers for OpenAI-compatible endpoints."""
+    provider_name = normalize_provider(provider_config.provider)
+    api_key = (provider_config.api_key or "").strip()
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    if provider_name == "openrouter":
+        headers.setdefault("HTTP-Referer", "https://hex-rays.com")
+        headers.setdefault("X-Title", "IDA Chat Plugin")
+
+    return headers
+
+
+def _resolve_openai_compat_base_url(provider_config: ProviderConfig) -> str:
+    """Resolve base URL for OpenAI-compatible providers."""
+    explicit_or_default = resolve_base_url(provider_config)
+    if explicit_or_default:
+        return explicit_or_default
+
+    provider_name = normalize_provider(provider_config.provider)
+    fallback = OPENAI_COMPAT_DEFAULT_BASE_URLS.get(provider_name)
+    if fallback:
+        return fallback
+
+    raise RuntimeError(f"No OpenAI-compatible base URL found for provider '{provider_name}'")
+
+
+def _query_openai_compat_sync(
+    provider_config: ProviderConfig,
+    messages: list[dict[str, str]],
+    timeout_seconds: float = 45.0,
+) -> str:
+    """Send a synchronous chat completion request to OpenAI-compatible endpoints."""
+    provider_name = normalize_provider(provider_config.provider)
+    if provider_name == "claude":
+        raise RuntimeError("OpenAI-compatible transport should not be used for Claude provider")
+
+    model = resolve_model(provider_config)
+    if not model:
+        raise RuntimeError("No model is configured for the selected provider")
+
+    endpoint = _normalize_openai_compat_endpoint(_resolve_openai_compat_base_url(provider_config))
+    payload = {
+        "model": model,
+        "messages": messages,
+    }
+
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=_build_openai_compat_headers(provider_config),
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            raw_body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as http_error:
+        body = http_error.read().decode("utf-8", errors="replace")
+        detail = _extract_error_message(body)
+        raise RuntimeError(
+            f"{provider_label(provider_name)} API request failed ({http_error.code}): {detail}"
+        ) from http_error
+    except urllib.error.URLError as url_error:
+        reason = str(url_error.reason).strip() or str(url_error)
+        raise RuntimeError(
+            f"{provider_label(provider_name)} request failed: {reason}"
+        ) from url_error
+
+    try:
+        response_json = json.loads(raw_body)
+    except json.JSONDecodeError as decode_error:
+        raise RuntimeError(
+            f"{provider_label(provider_name)} returned invalid JSON"
+        ) from decode_error
+
+    if isinstance(response_json, dict) and response_json.get("error"):
+        raise RuntimeError(_extract_error_message(json.dumps(response_json)))
+
+    if not isinstance(response_json, dict):
+        raise RuntimeError("Unexpected provider response format")
+
+    assistant_text = _extract_openai_compat_text(response_json).strip()
+    if not assistant_text:
+        raise RuntimeError("Provider returned an empty response")
+
+    return assistant_text
+
+
+async def _query_openai_compat(
+    provider_config: ProviderConfig,
+    messages: list[dict[str, str]],
+    timeout_seconds: float = 45.0,
+) -> str:
+    """Run OpenAI-compatible request off the event loop thread."""
+    return await asyncio.to_thread(
+        _query_openai_compat_sync,
+        provider_config,
+        messages,
+        timeout_seconds,
+    )
 
 
 def _iter_candidate_paths(tool_input: dict) -> list[str]:
@@ -259,6 +453,19 @@ async def test_provider_connection(provider_config: ProviderConfig) -> tuple[boo
     provider_name = normalize_provider(provider_config.provider)
     logger.info("Testing provider connection: %s", provider_name)
 
+    if provider_name != "claude":
+        try:
+            response_text = await _query_openai_compat(
+                provider_config,
+                [{"role": "user", "content": "Reply with one short sentence saying the connection is working."}],
+                timeout_seconds=30.0,
+            )
+            logger.info("Provider connection test successful via OpenAI-compatible transport: %s", provider_name)
+            return True, response_text
+        except Exception as e:
+            logger.error("OpenAI-compatible connection test failed for %s: %s", provider_name, e)
+            return False, str(e)
+
     stderr_lines: list[str] = []
 
     def _collect_stderr(line: str) -> None:
@@ -385,6 +592,9 @@ class IDAChatCore:
         self.history = history
         self.client: ClaudeSDKClient | None = None
         self._cancelled = False
+        self._provider_name = normalize_provider(self.provider_config.provider)
+        self._using_claude_sdk = self._provider_name == "claude"
+        self._system_prompt = ""
         # Use injected executor or default to direct execution
         self._execute_script = script_executor or self._default_execute_script
 
@@ -397,13 +607,22 @@ class IDAChatCore:
         """Initialize and connect the Agent SDK client."""
         provider_name = normalize_provider(self.provider_config.provider)
         selected_model = resolve_model(self.provider_config)
+        self._provider_name = provider_name
+        self._using_claude_sdk = provider_name == "claude"
+        self._system_prompt = _load_system_prompt()
 
         logger.info("=" * 60)
-        logger.info("Connecting to agent backend via Claude Agent SDK")
         logger.info("Provider: %s", provider_name)
         if selected_model:
             logger.info("Model override: %s", selected_model)
         logger.info(f"CWD: {PROJECT_DIR}")
+
+        if not self._using_claude_sdk:
+            logger.info("Connecting to agent backend via OpenAI-compatible HTTP transport")
+            self.client = None
+            return
+
+        logger.info("Connecting to agent backend via Claude Agent SDK")
 
         options = ClaudeAgentOptions(
             cwd=str(PROJECT_DIR),
@@ -416,7 +635,7 @@ class IDAChatCore:
             system_prompt={
                 "type": "preset",
                 "preset": "claude_code",
-                "append": _load_system_prompt(),
+                "append": self._system_prompt,
             },
             hooks={
                 'PreToolUse': [
@@ -434,6 +653,85 @@ class IDAChatCore:
         if self.client:
             await self.client.disconnect()
             self.client = None
+
+    async def _process_message_openai_compat(self, user_input: str) -> str:
+        """Agentic loop for OpenAI-compatible providers without Claude SDK."""
+        logger.info("-" * 60)
+        logger.info("USER MESSAGE (OpenAI-compatible): %s...", user_input[:200])
+
+        if self.history:
+            self.history.append_user_message(user_input)
+
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": self._system_prompt or _load_system_prompt()},
+        ]
+
+        current_input = user_input
+        all_script_outputs: list[str] = []
+        turn = 0
+        self._cancelled = False
+
+        while turn < self.max_turns:
+            if self._cancelled:
+                logger.info("Operation cancelled by user")
+                self.callback.on_error("Operation cancelled")
+                break
+
+            turn += 1
+            logger.info("=== TURN %s/%s (OpenAI-compatible) ===", turn, self.max_turns)
+            self.callback.on_turn_start(turn, self.max_turns)
+            self.callback.on_thinking()
+
+            messages.append({"role": "user", "content": current_input})
+
+            assistant_text = await _query_openai_compat(self.provider_config, messages)
+            messages.append({"role": "assistant", "content": assistant_text})
+
+            self.callback.on_thinking_done()
+
+            cleaned = IDASCRIPT_PATTERN.sub("", assistant_text).strip()
+            if cleaned:
+                self.callback.on_text(cleaned)
+                if self.history:
+                    self.history.append_assistant_message(cleaned)
+
+            scripts_found = [script.strip() for script in IDASCRIPT_PATTERN.findall(assistant_text)]
+
+            if not scripts_found:
+                logger.info("No scripts in response - agent is done")
+                break
+
+            script_outputs: list[str] = []
+            for index, script_code in enumerate(scripts_found, 1):
+                self.callback.on_script_code(script_code)
+                output = self._execute_script(script_code)
+                script_outputs.append(output)
+                all_script_outputs.append(output)
+
+                if output:
+                    self.callback.on_script_output(output)
+
+                if self.history:
+                    self.history.append_script_execution(script_code, output)
+
+                logger.debug("Script %s output (OpenAI-compatible): %s", index, output[:200])
+
+            if script_outputs:
+                formatted_outputs = []
+                for i, output in enumerate(script_outputs, 1):
+                    if len(scripts_found) > 1:
+                        formatted_outputs.append(f"Script {i} output:\n{output}")
+                    else:
+                        formatted_outputs.append(output)
+                current_input = "Script output:\n\n" + "\n\n".join(formatted_outputs)
+            else:
+                current_input = "Script executed successfully with no output."
+
+        if turn >= self.max_turns:
+            logger.warning("Reached maximum turns (%s)", self.max_turns)
+            self.callback.on_error(f"Reached maximum turns ({self.max_turns})")
+
+        return "\n".join(all_script_outputs) if all_script_outputs else ""
 
     def _default_execute_script(self, code: str) -> str:
         """Default script executor - direct execution.
@@ -569,6 +867,9 @@ class IDAChatCore:
         Returns:
             Combined script outputs as a string.
         """
+        if not self._using_claude_sdk:
+            return await self._process_message_openai_compat(user_input)
+
         if not self.client:
             raise RuntimeError("Client not connected. Call connect() first.")
 
