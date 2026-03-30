@@ -1771,6 +1771,10 @@ class IDAChatForm(ida_kernwin.PluginForm):
         ts = time.strftime("%H:%M:%S")
         self.metrics_browser.append(f"[{ts}] {msg}")
 
+    def on_metric(self, text: str):
+        """Route generic metric string from core."""
+        self.metrics_signal.emit(text)
+
     def _on_turn_start(self, turn: int, max_turns: int):
         """Called at the start of each agentic turn."""
         self._current_turn = turn

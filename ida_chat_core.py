@@ -97,6 +97,22 @@ OPENAI_COMPAT_DEFAULT_BASE_URLS = {
 }
 
 
+
+def get_model_context_length(model: str) -> int:
+    if not model:
+        return 8192
+    model = model.lower()
+    if any(x in model for x in ('gpt-4', 'o1', 'claude-3', 'kimi', 'gemini', 'llama3.1', 'llama-3.1', '128k', '256k', '200k')):
+        return 128000
+    if 'gpt-3.5' in model or '16k' in model:
+        return 16384
+    if any(x in model for x in ('llama3', 'llama-3', '8b', '7b', '32k')):
+        if '32k' in model:
+            return 32768
+        return 8192
+    return 8192 # default default
+
+
 def _load_system_prompt() -> str:
     """Load the system prompt from PROMPT.md.
 
@@ -231,7 +247,7 @@ def _resolve_openai_compat_base_url(provider_config: ProviderConfig) -> str:
 def _query_openai_compat_sync(
     provider_config: ProviderConfig,
     messages: list[dict[str, str]],
-    timeout_seconds: float = 45.0,
+    timeout_seconds: float = 120.0,
 ) -> str:
     """Send a synchronous chat completion request to OpenAI-compatible endpoints."""
     provider_name = normalize_provider(provider_config.provider)
@@ -293,7 +309,7 @@ def _query_openai_compat_sync(
 async def _query_openai_compat(
     provider_config: ProviderConfig,
     messages: list[dict[str, str]],
-    timeout_seconds: float = 45.0,
+    timeout_seconds: float = 120.0,
 ) -> str:
     """Run OpenAI-compatible request off the event loop thread."""
     return await asyncio.to_thread(
@@ -458,7 +474,7 @@ async def test_provider_connection(provider_config: ProviderConfig) -> tuple[boo
             response_text = await _query_openai_compat(
                 provider_config,
                 [{"role": "user", "content": "Reply with one short sentence saying the connection is working."}],
-                timeout_seconds=30.0,
+                timeout_seconds=120.0,
             )
             logger.info("Provider connection test successful via OpenAI-compatible transport: %s", provider_name)
             return True, response_text
@@ -515,6 +531,10 @@ class ChatCallback(Protocol):
     Implementations of this protocol handle the presentation layer,
     whether that's terminal output (CLI) or Qt widgets (Plugin).
     """
+
+    def on_metric(self, text: str) -> None:
+        """Called to log a metric or event string."""
+        ...
 
     def on_turn_start(self, turn: int, max_turns: int) -> None:
         """Called at the start of each agentic turn."""
@@ -673,7 +693,7 @@ class IDAChatCore:
             elif "google" in p or "gemini" in p:
                 light_model = "gemini-1.5-flash"
                 
-        logger.info(f"Condensing history using lightweight model: {light_model}")
+        if hasattr(self, "callback"): self.callback.on_metric(f"Condensing history via {light_model}")
         
         # In a real implementation we would await _query_openai_compat here
         # For now we insert a synthetic summary block to ensure API stability
@@ -704,7 +724,7 @@ class IDAChatCore:
             elif "google" in p or "gemini" in p:
                 light_model = "gemini-1.5-flash"
                 
-        logger.info(f"Condensing history using lightweight model: {light_model}")
+        if hasattr(self, "callback"): self.callback.on_metric(f"Condensing history via {light_model}")
         
         # In a real implementation we would await _query_openai_compat here
         # For now we insert a synthetic summary block to ensure API stability
@@ -735,7 +755,7 @@ class IDAChatCore:
             elif "google" in p or "gemini" in p:
                 light_model = "gemini-1.5-flash"
                 
-        logger.info(f"Condensing history using lightweight model: {light_model}")
+        if hasattr(self, "callback"): self.callback.on_metric(f"Condensing history via {light_model}")
         
         # In a real implementation we would await _query_openai_compat here
         # For now we insert a synthetic summary block to ensure API stability
@@ -777,8 +797,19 @@ class IDAChatCore:
 
             messages.append({"role": "user", "content": current_input})
 
+            self.callback.on_metric(f"Sending prompt to model ({len(messages)} messages)...")
             condensed_messages = await self._condense_history(messages)
+            
+            # check context length
+            estimated_tokens = sum(len(str(m.get("content", ""))) for m in condensed_messages) / 4
+            limit = get_model_context_length(self.provider_config.model if self.provider_config and self.provider_config.model else "unknown")
+            if estimated_tokens * 2 > limit:
+                if not getattr(self, "_warned_context", False):
+                    self.callback.on_error(f"WARNING: The model context limit ({limit} tokens) is dangerously small for the prompt ({estimated_tokens:.0f} tokens). History will be truncated!")
+                    self._warned_context = True
+
             assistant_text = await _query_openai_compat(self.provider_config, condensed_messages)
+            self.callback.on_metric(f"Received response ({len(assistant_text)} chars)")
             messages.append({"role": "assistant", "content": assistant_text})
 
             self.callback.on_thinking_done()
