@@ -11,6 +11,35 @@ Scripts have access to an open IDA database via the `db` variable. Use `print()`
 Prefer batch-style scripts with explicit limits for large results. This keeps responses fast,
 reduces token overhead, and improves reliability on large binaries.
 
+## MCP-Style Tool Tags (Preferred)
+
+The plugin supports high-level MCP-style tool tags that are faster and less error-prone than ad-hoc scripts.
+
+Use this format:
+
+```xml
+<idatool name="tool_name">{"queries": ["main", "0x401000"]}</idatool>
+```
+
+Available tools:
+- `analyze_function`
+- `decompile`
+- `disasm`
+- `int_convert`
+- `list_funcs`
+- `lookup_funcs`
+- `xrefs_to`
+
+Batch multiple tool calls in one turn whenever possible:
+
+```xml
+<idatool name="list_funcs">{"limit": 20, "filter": "main"}</idatool>
+<idatool name="analyze_function">{"queries": ["main"]}</idatool>
+<idatool name="xrefs_to">{"queries": ["main"]}</idatool>
+```
+
+When a high-level tool is insufficient, then use `<idascript>`.
+
 ## Common Patterns
 
 ### List All Functions

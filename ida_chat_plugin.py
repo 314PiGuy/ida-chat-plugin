@@ -786,6 +786,7 @@ class EventLogWidget(QScrollArea):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._entries: list[dict[str, str | float | None]] = []
         self._setup_ui()
 
     def _setup_ui(self):
@@ -803,6 +804,7 @@ class EventLogWidget(QScrollArea):
 
     def clear_events(self):
         """Clear all recorded events from the panel."""
+        self._entries.clear()
         while self.layout.count() > 1:
             item = self.layout.takeAt(0)
             if item and item.widget():
@@ -841,12 +843,46 @@ class EventLogWidget(QScrollArea):
         summary.setStyleSheet(f"color: {colors['text']};")
         frame_layout.addWidget(summary)
 
+        self._entries.append(
+            {
+                "time": ts,
+                "kind": kind,
+                "title": title,
+                "duration_ms": duration_ms,
+                "details": details,
+            }
+        )
+
         if details.strip():
             section = CollapsibleSection("Details", details, collapsed=True)
             frame_layout.addWidget(section)
 
         self.layout.insertWidget(self.layout.count() - 1, frame)
         QTimer.singleShot(10, lambda: self.verticalScrollBar().setValue(self.verticalScrollBar().maximum()))
+
+    def to_plain_text(self) -> str:
+        """Return the complete event log as plain text for copy/paste diagnostics."""
+        if not self._entries:
+            return "(no events recorded)"
+
+        chunks: list[str] = []
+        for entry in self._entries:
+            duration_ms = entry.get("duration_ms")
+            duration_text = ""
+            if isinstance(duration_ms, (int, float)) and duration_ms >= 0:
+                duration_text = f" [{duration_ms:.1f} ms]"
+
+            header = (
+                f"[{entry.get('time', '--:--:--')}] "
+                f"{entry.get('title', '')} ({entry.get('kind', '')}){duration_text}"
+            )
+            details = str(entry.get("details", "")).strip()
+            if details:
+                chunks.append(f"{header}\n{details}")
+            else:
+                chunks.append(header)
+
+        return "\n\n".join(chunks)
 
 
 class ChatInputWidget(QPlainTextEdit):
@@ -2382,6 +2418,23 @@ class IDAChatForm(ida_kernwin.PluginForm):
         metrics_toolbar_layout.addWidget(metrics_title)
         metrics_toolbar_layout.addStretch()
 
+        copy_events_btn = QPushButton("Copy Events")
+        copy_events_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {colors['button']};
+                color: {colors['button_text']};
+                border: 1px solid {colors['mid']};
+                border-radius: 4px;
+                padding: 2px 8px;
+            }}
+            QPushButton:hover {{
+                background-color: {colors['highlight']};
+                color: {colors['highlight_text']};
+            }}
+        """)
+        copy_events_btn.clicked.connect(self._on_copy_events)
+        metrics_toolbar_layout.addWidget(copy_events_btn)
+
         clear_events_btn = QPushButton("Clear Events")
         clear_events_btn.setStyleSheet(f"""
             QPushButton {{
@@ -2501,6 +2554,12 @@ class IDAChatForm(ida_kernwin.PluginForm):
         """Clear metrics/events panel entries."""
         self.events_log.clear_events()
         self._log_metric("Event log cleared")
+
+    def _on_copy_events(self):
+        """Copy full events log as plain text to clipboard."""
+        text = self.events_log.to_plain_text()
+        QApplication.clipboard().setText(text)
+        self._log_metric("Copied event log to clipboard")
 
     def OnClose(self, form):
         """Called when the widget is closed."""

@@ -61,6 +61,10 @@ PROJECT_DIR = Path(__file__).parent.resolve() / "project"
 
 # Regex to extract <idascript>...</idascript> blocks
 IDASCRIPT_PATTERN = re.compile(r"<idascript>(.*?)</idascript>", re.DOTALL)
+IDATOOL_PATTERN = re.compile(
+    r"<idatool\s+name=['\"](.*?)['\"]\s*>(.*?)</idatool>",
+    re.DOTALL | re.IGNORECASE,
+)
 DELEGATE_PATTERN = re.compile(r"<delegate agent=['\"](.*?)['\"]>(.*?)</delegate>", re.DOTALL | re.IGNORECASE)
 
 # Prompt file locations
@@ -134,7 +138,16 @@ def _compact_api_reference_text(text: str) -> str:
     return compact
 
 
-def _load_system_prompt(model_name: str | None = None) -> str:
+def _compact_markdown_text(text: str, max_lines: int = 220) -> str:
+    """Compact markdown while preserving headings and an initial context slice."""
+    lines = text.splitlines()
+    headings = [line for line in lines if line.lstrip().startswith("#")]
+    head = [line for line in lines[: max_lines // 2] if line.strip()]
+    compact = "\n".join((head + [""] + headings)[:max_lines])
+    return compact if compact.strip() else text[:5000]
+
+
+def _load_system_prompt(model_name: str | None = None, compact_docs: bool = False) -> str:
     """Load the system prompt from PROMPT.md.
 
     If running inside IDA Pro (IDA_CHAT_INSIDE_IDA env var is set),
@@ -152,14 +165,20 @@ def _load_system_prompt(model_name: str | None = None) -> str:
     if os.environ.get("IDA_CHAT_INSIDE_IDA") == "1":
         if IDA_UI_FILE.exists():
             logger.info("Running inside IDA - appending IDA.md to system prompt")
-            prompt += "\n\n" + IDA_UI_FILE.read_text(encoding="utf-8")
+            ida_ui_text = IDA_UI_FILE.read_text(encoding="utf-8")
+            if compact_docs:
+                ida_ui_text = _compact_markdown_text(ida_ui_text, max_lines=160)
+            prompt += "\n\n" + ida_ui_text
         else:
             logger.warning(f"IDA.md not found at {IDA_UI_FILE}")
 
     usage_text = USAGE_FILE.read_text(encoding="utf-8") if USAGE_FILE.exists() else ""
     api_text = API_REFERENCE_FILE.read_text(encoding="utf-8") if API_REFERENCE_FILE.exists() else ""
 
-    if model_name:
+    if compact_docs:
+        usage_text = _compact_markdown_text(usage_text, max_lines=180)
+        api_text = _compact_api_reference_text(api_text)
+    elif model_name:
         context_limit = get_model_context_length(model_name)
         full_prompt_tokens = (len(prompt) + len(usage_text) + len(api_text)) / 4
         # If static instructions alone consume over half the context, compact docs.
@@ -677,7 +696,10 @@ class IDAChatCore:
         selected_model = resolve_model(self.provider_config)
         self._provider_name = provider_name
         self._using_claude_sdk = provider_name == "claude"
-        self._system_prompt = _load_system_prompt(selected_model)
+        self._system_prompt = _load_system_prompt(
+            selected_model,
+            compact_docs=not self._using_claude_sdk,
+        )
 
         logger.info("=" * 60)
         logger.info("Provider: %s", provider_name)
@@ -773,6 +795,233 @@ class IDAChatCore:
                 "Reason: limit is less than 2x estimated prompt size."
             ),
             duration_ms=None,
+        )
+
+    def _normalize_generated_script(self, code: str) -> tuple[str, list[str]]:
+        """Apply safe compatibility rewrites to reduce avoidable script failures."""
+        normalized = code
+        fixes: list[str] = []
+
+        if "db.functions.get_by_name(" in normalized:
+            normalized = normalized.replace(
+                "db.functions.get_by_name(",
+                "db.functions.get_function_by_name(",
+            )
+            fixes.append("Replaced db.functions.get_by_name(...) with db.functions.get_function_by_name(...)")
+
+        if "len(callee)" in normalized and "callees" in normalized:
+            normalized = normalized.replace("len(callee)", "len(callees)")
+            fixes.append("Replaced len(callee) with len(callees)")
+
+        uses_re = bool(re.search(r"\bre\.", normalized))
+        has_re_import = bool(re.search(r"^\s*import\s+re\b", normalized, flags=re.MULTILINE))
+        if uses_re and not has_re_import:
+            normalized = "import re\n" + normalized
+            fixes.append("Prepended 'import re' because script uses re.*")
+
+        return normalized, fixes
+
+    def _parse_tool_payload(self, payload_text: str):
+        """Parse JSON payload for idatool calls, falling back to raw text."""
+        text = payload_text.strip()
+        if not text:
+            return {}
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text
+
+    def _as_query_list(self, payload, key: str = "queries") -> list[str]:
+        """Normalize flexible payloads into a list of query strings."""
+        if isinstance(payload, str):
+            return [q.strip() for q in payload.split(",") if q.strip()]
+        if isinstance(payload, list):
+            return [str(item).strip() for item in payload if str(item).strip()]
+        if isinstance(payload, dict):
+            value = payload.get(key) or payload.get("query") or payload.get("addr") or payload.get("name")
+            return self._as_query_list(value, key)
+        return []
+
+    def _resolve_func_query(self, query: str):
+        """Resolve function by address or by name."""
+        query = query.strip()
+        if not query:
+            return None
+
+        try:
+            ea = int(query, 0)
+            return self.db.functions.get_at(ea)
+        except ValueError:
+            return self.db.functions.get_function_by_name(query)
+
+    def _run_idatool(self, tool_name: str, payload_text: str) -> str:
+        """Execute a built-in MCP-style IDA tool and return JSON output text."""
+        tool = tool_name.strip().lower()
+        payload = self._parse_tool_payload(payload_text)
+
+        if tool == "int_convert":
+            inputs = self._as_query_list(payload, key="inputs")
+            if not inputs and isinstance(payload, dict):
+                value = payload.get("value")
+                if value is not None:
+                    inputs = [str(value)]
+
+            results = []
+            for raw in inputs:
+                try:
+                    value = int(str(raw), 0)
+                    bytes_len = max(1, (value.bit_length() + 7) // 8)
+                    results.append(
+                        {
+                            "input": raw,
+                            "dec": value,
+                            "hex": hex(value),
+                            "bin": bin(value),
+                            "bytes_be": value.to_bytes(bytes_len, byteorder="big", signed=value < 0).hex(),
+                        }
+                    )
+                except Exception as exc:
+                    results.append({"input": raw, "error": str(exc)})
+            return json.dumps({"tool": tool, "results": results}, ensure_ascii=False, indent=2)
+
+        if tool == "lookup_funcs":
+            queries = self._as_query_list(payload)
+            results = []
+            for query in queries:
+                func = self._resolve_func_query(query)
+                if not func:
+                    results.append({"query": query, "error": "not found"})
+                    continue
+                results.append(
+                    {
+                        "query": query,
+                        "name": self.db.functions.get_name(func),
+                        "start_ea": hex(func.start_ea),
+                        "end_ea": hex(func.end_ea),
+                    }
+                )
+            return json.dumps({"tool": tool, "results": results}, ensure_ascii=False, indent=2)
+
+        if tool == "list_funcs":
+            limit = 20
+            offset = 0
+            name_filter = ""
+            if isinstance(payload, dict):
+                limit = int(payload.get("limit", limit))
+                offset = int(payload.get("offset", offset))
+                name_filter = str(payload.get("filter", "")).strip().lower()
+
+            funcs = sorted(list(self.db.functions), key=lambda f: f.start_ea)
+            if name_filter:
+                funcs = [f for f in funcs if name_filter in self.db.functions.get_name(f).lower()]
+            selected = funcs[offset:offset + max(1, min(limit, 200))]
+
+            results = [
+                {
+                    "name": self.db.functions.get_name(func),
+                    "start_ea": hex(func.start_ea),
+                    "end_ea": hex(func.end_ea),
+                    "size": func.end_ea - func.start_ea,
+                }
+                for func in selected
+            ]
+            return json.dumps(
+                {
+                    "tool": tool,
+                    "count": len(results),
+                    "total_functions": len(funcs),
+                    "results": results,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        if tool in ("decompile", "disasm", "analyze_function"):
+            queries = self._as_query_list(payload)
+            query = queries[0] if queries else ""
+            func = self._resolve_func_query(query)
+            if not func:
+                return json.dumps({"tool": tool, "error": f"Function not found: {query}"}, ensure_ascii=False, indent=2)
+
+            name = self.db.functions.get_name(func)
+            result = {
+                "tool": tool,
+                "name": name,
+                "start_ea": hex(func.start_ea),
+                "end_ea": hex(func.end_ea),
+                "size": func.end_ea - func.start_ea,
+            }
+
+            if tool in ("decompile", "analyze_function"):
+                try:
+                    pseudocode = self.db.functions.get_pseudocode(func)
+                    result["pseudocode"] = "\n".join(pseudocode[:120])
+                except Exception as exc:
+                    result["pseudocode_error"] = str(exc)
+
+            if tool in ("disasm", "analyze_function"):
+                try:
+                    disasm = self.db.functions.get_disassembly(func)
+                    result["disassembly"] = "\n".join(disasm[:160])
+                except Exception as exc:
+                    result["disasm_error"] = str(exc)
+
+            if tool == "analyze_function":
+                try:
+                    callees = self.db.functions.get_callees(func)
+                    callers = self.db.functions.get_callers(func)
+                    result["callees"] = [self.db.functions.get_name(c) for c in callees[:40]]
+                    result["callers"] = [self.db.functions.get_name(c) for c in callers[:40]]
+                    result["callees_count"] = len(callees)
+                    result["callers_count"] = len(callers)
+                except Exception as exc:
+                    result["xref_error"] = str(exc)
+
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
+        if tool == "xrefs_to":
+            queries = self._as_query_list(payload)
+            results = []
+            for query in queries:
+                try:
+                    ea = int(query, 0)
+                except ValueError:
+                    func = self._resolve_func_query(query)
+                    if not func:
+                        results.append({"query": query, "error": "invalid address or function"})
+                        continue
+                    ea = func.start_ea
+
+                xrefs = []
+                for xref in self.db.xrefs.to_ea(ea):
+                    xrefs.append(
+                        {
+                            "from_ea": hex(xref.from_ea),
+                            "to_ea": hex(xref.to_ea),
+                            "type": str(getattr(xref.type, "name", xref.type)),
+                        }
+                    )
+
+                results.append({"query": query, "target": hex(ea), "count": len(xrefs), "xrefs": xrefs[:200]})
+
+            return json.dumps({"tool": tool, "results": results}, ensure_ascii=False, indent=2)
+
+        return json.dumps(
+            {
+                "tool": tool,
+                "error": "Unknown idatool",
+                "available_tools": [
+                    "analyze_function",
+                    "decompile",
+                    "disasm",
+                    "int_convert",
+                    "list_funcs",
+                    "lookup_funcs",
+                    "xrefs_to",
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
         )
 
     async def _condense_history(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -879,16 +1128,28 @@ class IDAChatCore:
             self.callback.on_thinking()
 
             if turn == 1 and not current_input.startswith("Script error:") and not current_input.startswith("<script_output"):
-                safe_input = f"[SYSTEM REMINDER: Do NOT summarize the API_REFERENCE.md. The target binary is already loaded in IDA. You MUST use <idascript> to query `db.*` and answer the user.]\n\nUSER REQUEST: {current_input}"
+                safe_input = (
+                    "[SYSTEM REMINDER: Do NOT summarize API docs. The target binary is loaded in IDA. "
+                    "Use <idascript> with db.* calls only. Use db.functions.get_function_by_name(...), not get_by_name(...). "
+                    "Import modules (like re) before use.]\n\n"
+                    f"USER REQUEST: {current_input}"
+                )
                 messages.append({"role": "user", "content": safe_input})
             else:
                 messages.append({"role": "user", "content": current_input})
 
-            self.callback.on_metric(f"Sending prompt to model ({len(messages)} messages)...")
             condensed_messages = await self._condense_history(messages)
             self._emit_context_warning_if_needed(condensed_messages)
 
-            request_preview = json.dumps(condensed_messages[-6:], ensure_ascii=False, indent=2)
+            preview_messages: list[dict[str, str]] = []
+            for msg in condensed_messages[-6:]:
+                role = str(msg.get("role", ""))
+                content = str(msg.get("content", ""))
+                if len(content) > 1200:
+                    content = content[:1200] + "\n... [truncated for log preview]"
+                preview_messages.append({"role": role, "content": content})
+
+            request_preview = json.dumps(preview_messages, ensure_ascii=False, indent=2)
             self.callback.on_metric(f"Sending prompt to model ({len(condensed_messages)} messages)...")
             self.callback.on_event(
                 "model_request",
@@ -912,23 +1173,87 @@ class IDAChatCore:
                 assistant_text,
                 duration_ms=request_elapsed_ms,
             )
-            messages.append({"role": "assistant", "content": assistant_text})
+
+            scripts_found = [script.strip() for script in IDASCRIPT_PATTERN.findall(assistant_text)]
+            idatools_found = [
+                (name.strip().lower(), payload.strip())
+                for name, payload in IDATOOL_PATTERN.findall(assistant_text)
+            ]
+            cleaned = IDATOOL_PATTERN.sub("", IDASCRIPT_PATTERN.sub("", assistant_text)).strip()
+
+            # Keep a compact assistant message in rolling context to reduce token churn.
+            compact_text = cleaned[:800]
+            if cleaned and len(cleaned) > 800:
+                compact_text += " ..."
+
+            if scripts_found or idatools_found:
+                script_bundle = "\n\n".join(
+                    f"<idascript>\n{code}\n</idascript>" for code in scripts_found
+                )
+                tool_bundle = "\n\n".join(
+                    f"<idatool name=\"{name}\">\n{payload}\n</idatool>"
+                    for name, payload in idatools_found
+                )
+                combined_bundle = "\n\n".join(
+                    chunk for chunk in (script_bundle, tool_bundle) if chunk.strip()
+                )
+                assistant_for_context = (
+                    f"{compact_text}\n\n{combined_bundle}" if compact_text else combined_bundle
+                )
+            else:
+                assistant_for_context = compact_text or assistant_text[:800]
+
+            messages.append({"role": "assistant", "content": assistant_for_context})
 
             self.callback.on_thinking_done()
 
-            cleaned = IDASCRIPT_PATTERN.sub("", assistant_text).strip()
             if cleaned:
                 self.callback.on_text(cleaned)
                 if self.history:
                     self.history.append_assistant_message(cleaned)
 
-            scripts_found = [script.strip() for script in IDASCRIPT_PATTERN.findall(assistant_text)]
-
-            if not scripts_found:
-                logger.info("No scripts in response - agent is done")
+            if not scripts_found and not idatools_found:
+                logger.info("No scripts/tools in response - agent is done")
                 break
 
             script_outputs: list[str] = []
+
+            for tool_index, (tool_name, tool_payload) in enumerate(idatools_found, 1):
+                tool_display = f"idatool:{tool_name}"
+                self.callback.on_tool_use(tool_display, "mcp-style tool call")
+
+                tool_use_id = f"idatool_{int(time.time() * 1000)}_{tool_index}"
+                if self.history:
+                    self.history.append_tool_use(
+                        tool_display,
+                        {"payload": tool_payload},
+                        tool_use_id=tool_use_id,
+                    )
+
+                self.callback.on_event(
+                    "idatool_request",
+                    f"IDATool Request ({tool_name})",
+                    tool_payload,
+                    duration_ms=None,
+                )
+
+                tool_started = time.perf_counter()
+                tool_output = self._run_idatool(tool_name, tool_payload)
+                tool_elapsed_ms = (time.perf_counter() - tool_started) * 1000.0
+
+                script_outputs.append(tool_output)
+                all_script_outputs.append(tool_output)
+                self.callback.on_script_output(tool_output)
+                self.callback.on_event(
+                    "idatool_response",
+                    f"IDATool Response ({tool_name})",
+                    tool_output,
+                    duration_ms=tool_elapsed_ms,
+                )
+
+                if self.history:
+                    self.history.append_tool_result(tool_use_id, tool_output, is_error=False)
+
             # Handle delegation tool
             delegations = DELEGATE_PATTERN.findall(assistant_text)
             for i, (agent, task) in enumerate(delegations, 1):
@@ -965,6 +1290,17 @@ class IDAChatCore:
                     self.history.append_tool_result(delegate_id, delegation_output, is_error=False)
 
             for index, script_code in enumerate(scripts_found, 1):
+                normalized_code, fixes = self._normalize_generated_script(script_code)
+                if fixes:
+                    self.callback.on_metric(f"Auto-fixed script {index}: {', '.join(fixes)}")
+                    self.callback.on_event(
+                        "script_fix",
+                        f"Script {index} Compatibility Fixes",
+                        "\n".join(fixes),
+                        duration_ms=None,
+                    )
+                script_code = normalized_code
+
                 self.callback.on_script_code(script_code)
                 self.callback.on_event(
                     "script_input",
@@ -1113,11 +1449,58 @@ class IDAChatCore:
                 if full_text:
                     combined = "".join(full_text)
                     scripts_found = IDASCRIPT_PATTERN.findall(combined)
+                    idatools_found = [
+                        (name.strip().lower(), payload.strip())
+                        for name, payload in IDATOOL_PATTERN.findall(combined)
+                    ]
                     logger.info(f"Found {len(scripts_found)} scripts in response")
+
+                    # Execute idatool calls first (mcp-style high-level tools).
+                    for tool_index, (tool_name, tool_payload) in enumerate(idatools_found, 1):
+                        tool_display = f"idatool:{tool_name}"
+                        self.callback.on_tool_use(tool_display, "mcp-style tool call")
+                        self.callback.on_event(
+                            "idatool_request",
+                            f"IDATool Request ({tool_name})",
+                            tool_payload,
+                            duration_ms=None,
+                        )
+
+                        tool_started = time.perf_counter()
+                        tool_output = self._run_idatool(tool_name, tool_payload)
+                        tool_elapsed_ms = (time.perf_counter() - tool_started) * 1000.0
+
+                        script_outputs.append(tool_output)
+                        self.callback.on_script_output(tool_output)
+                        self.callback.on_event(
+                            "idatool_response",
+                            f"IDATool Response ({tool_name})",
+                            tool_output,
+                            duration_ms=tool_elapsed_ms,
+                        )
+
+                        if self.history:
+                            tool_use_id = f"idatool_{int(time.time() * 1000)}_{tool_index}"
+                            self.history.append_tool_use(
+                                tool_display,
+                                {"payload": tool_payload},
+                                tool_use_id=tool_use_id,
+                            )
+                            self.history.append_tool_result(tool_use_id, tool_output, is_error=False)
 
                     # Execute each script
                     for j, script_code in enumerate(scripts_found):
                         code = script_code.strip()
+                        code, fixes = self._normalize_generated_script(code)
+                        if fixes:
+                            self.callback.on_metric(f"Auto-fixed script {j + 1}: {', '.join(fixes)}")
+                            self.callback.on_event(
+                                "script_fix",
+                                f"Script {j + 1} Compatibility Fixes",
+                                "\n".join(fixes),
+                                duration_ms=None,
+                            )
+
                         logger.debug(f"Script {j+1}:\n{code}")
                         self.callback.on_script_code(code)
                         self.callback.on_event(
@@ -1146,6 +1529,10 @@ class IDAChatCore:
                         # Log script execution to history
                         if self.history:
                             self.history.append_script_execution(code, output)
+
+                    if idatools_found and not scripts_found:
+                        # Keep outer loop alive so tool outputs are fed back to the model.
+                        scripts_found = ["<idatool_batch>"]
 
                 if self.verbose:
                     self.callback.on_result(

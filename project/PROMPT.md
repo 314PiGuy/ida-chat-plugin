@@ -8,7 +8,9 @@ Workflow rules:
 - Use only the pre-injected `db` object and ida-domain API.
 - Never import `idaapi`, `idc`, or `idautils`.
 - Use `<idascript>...</idascript>` to inspect/analyze the real binary.
-- Prefer batched tool usage: include multiple scripts/delegations in one response when safe.
+- Prefer MCP-style high-level tools when possible using `<idatool name="...">JSON payload</idatool>`.
+	Available: `analyze_function`, `decompile`, `disasm`, `int_convert`, `list_funcs`, `lookup_funcs`, `xrefs_to`.
+- Batch aggressively: include all required `<idatool>`, `<idascript>`, and `<delegate>` calls in one response turn when safe.
 - Keep output concise and factual. No filler or thought narration.
 
 Context and scale rules:
