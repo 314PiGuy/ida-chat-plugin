@@ -85,8 +85,12 @@ class CollapsibleSection(QFrame):
         self.content_label.setTextFormat(Qt.RichText)
         self.content_label.setWordWrap(True)
         self.content_label.setTextInteractionFlags(
-            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
+            Qt.TextSelectableByMouse
+            | Qt.TextSelectableByKeyboard
+            | Qt.LinksAccessibleByMouse
+            | Qt.LinksAccessibleByKeyboard
         )
+        self.content_label.setOpenExternalLinks(False)
         self.content_label.setStyleSheet(f"""
             QLabel {{
                 background-color: {colors['alt_base']};

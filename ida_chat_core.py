@@ -22,7 +22,12 @@ from typing import Callable, Protocol, TYPE_CHECKING
 import claude_code_transcripts
 from ida_chat_logging_utils import logger
 from ida_chat_tool_catalog import AVAILABLE_IDATOOLS
-from ida_chat_patterns import DELEGATE_PATTERN, IDASCRIPT_PATTERN, IDATOOL_PATTERN
+from ida_chat_patterns import (
+    extract_delegate_calls,
+    extract_idascripts,
+    extract_idatool_calls,
+    strip_agent_tags,
+)
 
 if TYPE_CHECKING:
     from ida_chat_history import MessageHistory
@@ -100,6 +105,8 @@ def get_model_context_length(model: str) -> int:
         return 200000
     if any(x in model for x in ("gemini-1.5", "gemini-2", "kimi", "deepseek")):
         return 128000
+    if any(x in model for x in ("mistral", "nemotron")):
+        return 32768
     if "gpt-4" in model:
         return 128000
     if any(x in model for x in ("32k", "llama-3.1-70b", "llama3.1-70b")):
@@ -1015,6 +1022,11 @@ class IDAChatCore:
                 "Replaced db.functions.get_function_by_addr(...) with db.functions.get_at(...)",
             ),
             (
+                "db.functions.get_function_at_addr(",
+                "db.functions.get_at(",
+                "Replaced db.functions.get_function_at_addr(...) with db.functions.get_at(...)",
+            ),
+            (
                 "db.instructions.iter_range(",
                 "db.instructions.get_between(",
                 "Replaced db.instructions.iter_range(...) with db.instructions.get_between(...)",
@@ -1043,6 +1055,16 @@ class IDAChatCore:
                 "db.xrefs.get_xrefs_from(",
                 "db.xrefs.from_ea(",
                 "Replaced db.xrefs.get_xrefs_from(...) with db.xrefs.from_ea(...)",
+            ),
+            (
+                "db.xrefs.find_to(",
+                "db.xrefs.to_ea(",
+                "Replaced db.xrefs.find_to(...) with db.xrefs.to_ea(...)",
+            ),
+            (
+                "db.xrefs.get_xref_to(",
+                "db.xrefs.to_ea(",
+                "Replaced db.xrefs.get_xref_to(...) with db.xrefs.to_ea(...)",
             ),
         ]
 
@@ -1189,6 +1211,10 @@ def _compat_ea(value):
             normalized = normalized.replace("db.functions.get_function_by_addr(", "db.functions.get_at(")
             fixes.append("Recovered from get_function_by_addr error using db.functions.get_at(...)")
 
+        if "object has no attribute 'get_function_at_addr'" in error_text and "db.functions.get_function_at_addr(" in normalized:
+            normalized = normalized.replace("db.functions.get_function_at_addr(", "db.functions.get_at(")
+            fixes.append("Recovered from get_function_at_addr error using db.functions.get_at(...)")
+
         if "object has no attribute 'iter_range'" in error_text and "db.instructions.iter_range(" in normalized:
             normalized = normalized.replace("db.instructions.iter_range(", "db.instructions.get_between(")
             fixes.append("Recovered from iter_range error using db.instructions.get_between(...)")
@@ -1208,6 +1234,14 @@ def _compat_ea(value):
         if "object has no attribute 'get_xrefs_from'" in error_text and "db.xrefs.get_xrefs_from(" in normalized:
             normalized = normalized.replace("db.xrefs.get_xrefs_from(", "db.xrefs.from_ea(")
             fixes.append("Recovered from get_xrefs_from error using db.xrefs.from_ea(...)")
+
+        if "object has no attribute 'find_to'" in error_text and "db.xrefs.find_to(" in normalized:
+            normalized = normalized.replace("db.xrefs.find_to(", "db.xrefs.to_ea(")
+            fixes.append("Recovered from find_to error using db.xrefs.to_ea(...)")
+
+        if "object has no attribute 'get_xref_to'" in error_text and "db.xrefs.get_xref_to(" in normalized:
+            normalized = normalized.replace("db.xrefs.get_xref_to(", "db.xrefs.to_ea(")
+            fixes.append("Recovered from get_xref_to error using db.xrefs.to_ea(...)")
 
         if "object has no attribute 'start_ea'" in error_text:
             normalized, start_ea_subs = re.subn(
@@ -1470,6 +1504,8 @@ print(json.dumps(results, ensure_ascii=False))
                 payload.get(key)
                 or payload.get("query")
                 or payload.get("queries")
+                or payload.get("prefix")
+                or payload.get("name_prefix")
                 or payload.get("addr")
                 or payload.get("ea")
                 or payload.get("address")
@@ -1511,6 +1547,7 @@ print(json.dumps(results, ensure_ascii=False))
 
         query_payload = json.dumps({"queries": queries}, ensure_ascii=False)
         return [
+            ("find_main", query_payload),
             ("list_funcs", json.dumps({"limit": 40}, ensure_ascii=False)),
             ("lookup_funcs", query_payload),
             ("analyze_function", query_payload),
@@ -1522,7 +1559,35 @@ print(json.dumps(results, ensure_ascii=False))
         Uses the configured script executor so all IDA operations run on the main
         thread when needed (plugin mode), avoiding thread-affinity crashes.
         """
-        tool = tool_name.strip().lower()
+        tool = tool_name.strip().lower().replace("-", "_")
+        tool_aliases = {
+            "look_up": "lookup_funcs",
+            "lookup": "lookup_funcs",
+            "lookup_function": "lookup_funcs",
+            "lookup_functions": "lookup_funcs",
+            "list_functions": "list_funcs",
+            "search_functions": "list_funcs",
+            "find_functions": "list_funcs",
+            "disassemble": "disasm",
+            "decompile_function": "decompile",
+            "xref_to": "xrefs_to",
+            "xrefs": "xrefs_to",
+            "search_string": "search_strings",
+            "find_strings": "search_strings",
+            "string_search": "search_strings",
+            "jump": "jump_to",
+            "goto": "jump_to",
+            "go_to": "jump_to",
+            "navigate": "jump_to",
+            "navigate_to": "jump_to",
+            "focus": "jump_to",
+            "focus_view": "jump_to",
+            "debug": "debugger",
+            "dbg": "debugger",
+            "debug_control": "debugger",
+            "debugger_control": "debugger",
+        }
+        tool = tool_aliases.get(tool, tool)
         payload = self._parse_tool_payload(payload_text)
 
         script = f"""
@@ -1572,7 +1637,7 @@ def as_query_list(value, key='queries'):
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
     if isinstance(value, dict):
-        v = value.get(key) or value.get('query') or value.get('queries') or value.get('addr') or value.get('ea') or value.get('address') or value.get('addresses') or value.get('name')
+        v = value.get(key) or value.get('query') or value.get('queries') or value.get('prefix') or value.get('name_prefix') or value.get('addr') or value.get('ea') or value.get('address') or value.get('addresses') or value.get('name')
         return as_query_list(v, key)
     return []
 
@@ -1580,7 +1645,8 @@ def resolve_func(query):
     query = str(query).strip()
     query = re.sub(r'^\\s*<!\\[CDATA\\[', '', query, flags=re.IGNORECASE)
     query = re.sub(r'\\]\\]>\\s*$', '', query, flags=re.IGNORECASE)
-    query = query.strip().strip('"\'')
+    query = query.strip('"')
+    query = query.strip("'")
     if not query:
         return None
 
@@ -1663,16 +1729,79 @@ elif tool == 'lookup_funcs':
         }})
     result = {{'tool': tool, 'results': rows}}
 
+elif tool == 'find_main':
+    default_queries = [
+        'main.main',
+        'main',
+        'WinMain',
+        'wmain',
+        '_start',
+        'start',
+        'entry',
+        'runtime.main',
+    ]
+    queries = as_query_list(payload)
+    if not queries:
+        queries = default_queries
+
+    rows = []
+    seen = set()
+    for query in queries:
+        func = resolve_func(query)
+        if not func:
+            continue
+        key = int(func.start_ea)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({{
+            'query': query,
+            'name': db.functions.get_name(func),
+            'start_ea': hex(func.start_ea),
+            'end_ea': hex(func.end_ea),
+            'size': func.end_ea - func.start_ea,
+        }})
+
+    if not rows:
+        funcs = sorted(list(db.functions), key=lambda f: f.start_ea)
+        for func in funcs:
+            name = str(db.functions.get_name(func) or '')
+            lower_name = name.lower()
+            if (
+                lower_name in ('main', 'winmain', 'wmain', '_start', 'start', 'entry', 'runtime.main', 'main.main')
+                or lower_name.endswith('.main')
+            ):
+                rows.append({{
+                    'query': name,
+                    'name': name,
+                    'start_ea': hex(func.start_ea),
+                    'end_ea': hex(func.end_ea),
+                    'size': func.end_ea - func.start_ea,
+                }})
+            if len(rows) >= 25:
+                break
+
+    result = {{'tool': tool, 'count': len(rows), 'results': rows}}
+
 elif tool == 'list_funcs':
     limit = 20
     offset = 0
     filt = ''
+    filt_regex = ''
+    regex_error = ''
     if isinstance(payload, dict):
         limit = int(payload.get('limit', limit))
         offset = int(payload.get('offset', offset))
-        filt = str(payload.get('filter', '')).strip().lower()
+        filt = str(payload.get('filter') or payload.get('prefix') or payload.get('name_prefix') or '').strip().lower()
+        filt_regex = str(payload.get('filter_regex', '')).strip()
     funcs = sorted(list(db.functions), key=lambda f: f.start_ea)
-    if filt:
+    if filt_regex:
+        try:
+            rx = re.compile(filt_regex, re.IGNORECASE)
+            funcs = [f for f in funcs if rx.search(db.functions.get_name(f) or '')]
+        except Exception as exc:
+            regex_error = str(exc)
+    elif filt:
         funcs = [f for f in funcs if filt in db.functions.get_name(f).lower()]
     selected = funcs[offset:offset + max(1, min(limit, 200))]
     rows = []
@@ -1684,11 +1813,118 @@ elif tool == 'list_funcs':
             'size': func.end_ea - func.start_ea,
         }})
     result = {{'tool': tool, 'count': len(rows), 'total_functions': len(funcs), 'results': rows}}
+    if regex_error:
+        result['regex_error'] = regex_error
+
+elif tool == 'search_strings':
+    queries = as_query_list(payload)
+    limit = 40
+    offset = 0
+    regex_mode = False
+    ignore_case = True
+    match_all = False
+    max_len = 220
+    regex_errors = []
+
+    if isinstance(payload, dict):
+        if not queries:
+            queries = as_query_list(payload.get('patterns') or payload.get('keywords'), key='patterns')
+        limit = int(payload.get('limit', limit))
+        offset = int(payload.get('offset', offset))
+        regex_mode = bool(payload.get('regex', False))
+        ignore_case = bool(payload.get('ignore_case', payload.get('case_insensitive', True)))
+        match_all = bool(payload.get('all', False))
+        max_len = int(payload.get('max_len', max_len))
+
+    limit = max(1, min(limit, 300))
+    offset = max(0, offset)
+    max_len = max(40, min(max_len, 1000))
+
+    compiled = []
+    if regex_mode:
+        flags = re.IGNORECASE if ignore_case else 0
+        for term in queries:
+            try:
+                compiled.append((term, re.compile(term, flags)))
+            except Exception as exc:
+                regex_errors.append({{'pattern': term, 'error': str(exc)}})
+
+    scanned = 0
+    total_matches = 0
+    rows = []
+
+    for s in db.strings:
+        try:
+            text = str(s)
+        except Exception:
+            continue
+        if not text:
+            continue
+        scanned += 1
+
+        hits = []
+        if queries:
+            if regex_mode:
+                for term, rx in compiled:
+                    if rx.search(text):
+                        hits.append(term)
+            else:
+                haystack = text.lower() if ignore_case else text
+                for term in queries:
+                    needle = term.lower() if ignore_case else term
+                    if needle in haystack:
+                        hits.append(term)
+
+            matched = len(hits) == len(queries) if match_all else bool(hits)
+            if not matched:
+                continue
+
+        total_matches += 1
+        if total_matches <= offset:
+            continue
+        if len(rows) >= limit:
+            continue
+
+        ea = getattr(s, 'address', None)
+        if ea is None:
+            ea = getattr(s, 'ea', None)
+
+        row = {{
+            'value': text[:max_len],
+            'length': len(text),
+        }}
+        if ea is not None:
+            row['address'] = hex(int(ea))
+        if hits:
+            row['matched'] = hits
+        rows.append(row)
+
+    result = {{
+        'tool': tool,
+        'queries': queries,
+        'count': len(rows),
+        'total_matches': total_matches,
+        'scanned': scanned,
+        'results': rows,
+    }}
+    if regex_errors:
+        result['regex_errors'] = regex_errors
 
 elif tool in ('decompile', 'disasm', 'analyze_function'):
     queries = as_query_list(payload)
     if not queries:
         queries = ['main', 'main.main', 'runtime.main', 'WinMain', 'wmain', '_start', 'start']
+    max_pseudocode_lines = 120
+    max_disasm_lines = 160
+    if isinstance(payload, dict):
+        max_lines = int(payload.get('max_lines', 0) or 0)
+        if max_lines > 0:
+            max_pseudocode_lines = max_lines
+            max_disasm_lines = max_lines
+        max_pseudocode_lines = int(payload.get('max_pseudocode_lines', max_pseudocode_lines))
+        max_disasm_lines = int(payload.get('max_disasm_lines', max_disasm_lines))
+    max_pseudocode_lines = max(20, min(max_pseudocode_lines, 400))
+    max_disasm_lines = max(20, min(max_disasm_lines, 500))
     attempts = []
     resolved_query = ''
     func = None
@@ -1719,12 +1955,12 @@ elif tool in ('decompile', 'disasm', 'analyze_function'):
         }}
         if tool in ('decompile', 'analyze_function'):
             try:
-                out['pseudocode'] = '\\n'.join(db.functions.get_pseudocode(func)[:120])
+                out['pseudocode'] = '\\n'.join(db.functions.get_pseudocode(func)[:max_pseudocode_lines])
             except Exception as exc:
                 out['pseudocode_error'] = str(exc)
         if tool in ('disasm', 'analyze_function'):
             try:
-                out['disassembly'] = '\\n'.join(db.functions.get_disassembly(func)[:160])
+                out['disassembly'] = '\\n'.join(db.functions.get_disassembly(func)[:max_disasm_lines])
             except Exception as exc:
                 out['disasm_error'] = str(exc)
         if tool == 'analyze_function':
@@ -1762,6 +1998,372 @@ elif tool == 'xrefs_to':
             }})
         rows.append({{'query': query, 'target': hex(ea), 'count': len(xrefs), 'xrefs': xrefs[:200]}})
     result = {{'tool': tool, 'results': rows}}
+
+elif tool == 'jump_to':
+    queries = as_query_list(payload)
+    view = 'disasm'
+    if isinstance(payload, dict):
+        view = str(payload.get('view', payload.get('mode', view))).strip().lower() or 'disasm'
+        if not queries:
+            queries = as_query_list(
+                payload.get('target')
+                or payload.get('targets')
+                or payload.get('function')
+                or payload.get('functions')
+                or payload.get('name')
+                or payload.get('names')
+            )
+
+    if not queries:
+        queries = ['main.main', 'main']
+
+    rows = []
+
+    try:
+        import ida_kernwin
+    except Exception as exc:
+        result = {{
+            'tool': tool,
+            'error': f'ida_kernwin unavailable: {{exc}}',
+            'queries': queries,
+        }}
+    else:
+        for query in queries:
+            target_ea = None
+            func = None
+            try:
+                target_ea = int(str(query), 0)
+            except Exception:
+                func = resolve_func(query)
+                if func:
+                    target_ea = int(func.start_ea)
+
+            if target_ea is None:
+                rows.append({{'query': query, 'error': 'invalid address or function'}})
+                continue
+
+            row = {{
+                'query': query,
+                'target': hex(target_ea),
+                'view': view,
+            }}
+
+            if func:
+                row['name'] = db.functions.get_name(func)
+
+            try:
+                if view in ('pseudocode', 'pseudo', 'decompile'):
+                    opened = False
+                    open_errors = []
+
+                    open_pseudocode = getattr(ida_kernwin, 'open_pseudocode', None)
+                    if callable(open_pseudocode):
+                        try:
+                            opened = bool(open_pseudocode(target_ea, 0))
+                            row['method'] = 'ida_kernwin.open_pseudocode'
+                        except Exception as exc:
+                            open_errors.append(str(exc))
+
+                    if not opened:
+                        try:
+                            import ida_hexrays
+
+                            hr_open = getattr(ida_hexrays, 'open_pseudocode', None)
+                            if callable(hr_open):
+                                opened = bool(hr_open(target_ea, 0))
+                                row['method'] = 'ida_hexrays.open_pseudocode'
+                        except Exception as exc:
+                            open_errors.append(str(exc))
+
+                    if not opened:
+                        row['opened_pseudocode'] = False
+                        row['jumped'] = bool(ida_kernwin.jumpto(target_ea))
+                        if open_errors:
+                            row['pseudocode_error'] = '; '.join(open_errors)
+                    else:
+                        row['opened_pseudocode'] = True
+                        row['jumped'] = True
+                else:
+                    row['jumped'] = bool(ida_kernwin.jumpto(target_ea))
+                    row['method'] = 'ida_kernwin.jumpto'
+            except Exception as exc:
+                row['error'] = str(exc)
+
+            rows.append(row)
+
+        result = {{'tool': tool, 'results': rows}}
+
+elif tool == 'debugger':
+    action = 'status'
+    query = ''
+    step_count = 1
+    reg_names = ['rip', 'eip', 'pc', 'rax', 'rbx', 'rcx', 'rdx', 'rsi', 'rdi', 'rsp', 'rbp']
+
+    if isinstance(payload, dict):
+        action = str(payload.get('action', action)).strip().lower() or 'status'
+        q = payload.get('query') or payload.get('target') or payload.get('ea') or payload.get('address')
+        q_list = as_query_list(q)
+        if q_list:
+            query = q_list[0]
+        step_count = int(payload.get('count', payload.get('steps', step_count)) or 1)
+        raw_regs = payload.get('registers')
+        if isinstance(raw_regs, list):
+            cleaned_regs = [str(name).strip().lower() for name in raw_regs if str(name).strip()]
+            if cleaned_regs:
+                reg_names = cleaned_regs
+    else:
+        q_list = as_query_list(payload)
+        if q_list:
+            action = q_list[0].strip().lower() or 'status'
+            if len(q_list) > 1:
+                query = q_list[1]
+
+    step_count = max(1, min(step_count, 20))
+
+    def call_first(module, names, *args):
+        attempts = []
+        for name in names:
+            fn = getattr(module, name, None)
+            if not callable(fn):
+                continue
+            try:
+                return name, fn(*args), ''
+            except Exception as exc:
+                attempts.append(f"{{name}}: {{exc}}")
+        if attempts:
+            return '', None, '; '.join(attempts)
+        return '', None, 'No compatible API method found'
+
+    def parse_target_ea(raw_query):
+        if raw_query is None:
+            return None
+        query_text = str(raw_query).strip()
+        if not query_text:
+            return None
+        try:
+            return int(query_text, 0)
+        except Exception:
+            func = resolve_func(query_text)
+            if func:
+                return int(func.start_ea)
+        return None
+
+    def get_ip_value(ida_dbg_module):
+        method, value, _err = call_first(ida_dbg_module, ['get_ip_val'])
+        if method:
+            return value, method
+        get_reg = getattr(ida_dbg_module, 'get_reg_val', None)
+        if callable(get_reg):
+            for reg_name in ('rip', 'eip', 'pc'):
+                try:
+                    value = get_reg(reg_name)
+                    if value is not None:
+                        return value, f'get_reg_val({{reg_name}})'
+                except Exception:
+                    continue
+        return None, ''
+
+    try:
+        import ida_dbg
+    except Exception as exc:
+        result = {{'tool': tool, 'action': action, 'error': f'ida_dbg unavailable: {{exc}}'}}
+    else:
+        out = {{'tool': tool, 'action': action}}
+
+        dbg_on = False
+        is_on = getattr(ida_dbg, 'is_debugger_on', None)
+        if callable(is_on):
+            try:
+                dbg_on = bool(is_on())
+            except Exception:
+                dbg_on = False
+        out['debugger_on'] = dbg_on
+
+        state_method, state_value, state_error = call_first(ida_dbg, ['get_process_state'])
+        if state_method:
+            out['process_state'] = str(state_value)
+            out['state_method'] = state_method
+        elif state_error:
+            out['state_error'] = state_error
+
+        if action == 'status':
+            ip_value, ip_method = get_ip_value(ida_dbg)
+            if ip_method:
+                out['ip_method'] = ip_method
+            if ip_value is not None:
+                try:
+                    out['ip'] = hex(int(ip_value))
+                except Exception:
+                    out['ip'] = str(ip_value)
+
+            registers = {{}}
+            get_reg = getattr(ida_dbg, 'get_reg_val', None)
+            if callable(get_reg):
+                for reg_name in reg_names:
+                    try:
+                        value = get_reg(reg_name)
+                    except Exception:
+                        continue
+                    if value is None:
+                        continue
+                    try:
+                        registers[reg_name] = hex(int(value))
+                    except Exception:
+                        registers[reg_name] = str(value)
+            if registers:
+                out['registers'] = registers
+
+        elif action in ('run', 'continue', 'resume'):
+            method, value, error = call_first(
+                ida_dbg,
+                ['continue_process', 'request_continue_process'],
+            )
+            if method:
+                out['method'] = method
+                out['result'] = str(value)
+                out['ok'] = True
+            else:
+                out['error'] = error
+
+        elif action in ('pause', 'break', 'suspend', 'stop'):
+            method, value, error = call_first(
+                ida_dbg,
+                ['suspend_process', 'request_suspend_process', 'pause_process'],
+            )
+            if method:
+                out['method'] = method
+                out['result'] = str(value)
+                out['ok'] = True
+            else:
+                out['error'] = error
+
+        elif action in ('step_into', 'si'):
+            performed = []
+            for _ in range(step_count):
+                method, value, error = call_first(
+                    ida_dbg,
+                    ['step_into', 'request_step_into', 'step_into_instruction', 'request_step_into_instruction'],
+                )
+                if not method:
+                    out['error'] = error
+                    break
+                performed.append({{'method': method, 'result': str(value)}})
+            out['steps'] = performed
+            out['ok'] = bool(performed) and 'error' not in out
+
+        elif action in ('step_over', 'so'):
+            performed = []
+            for _ in range(step_count):
+                method, value, error = call_first(
+                    ida_dbg,
+                    ['step_over', 'request_step_over', 'step_over_instruction', 'request_step_over_instruction'],
+                )
+                if not method:
+                    out['error'] = error
+                    break
+                performed.append({{'method': method, 'result': str(value)}})
+            out['steps'] = performed
+            out['ok'] = bool(performed) and 'error' not in out
+
+        elif action in ('step_out', 'finish'):
+            method, value, error = call_first(
+                ida_dbg,
+                ['step_until_ret', 'request_step_until_ret', 'step_out', 'request_step_out'],
+            )
+            if method:
+                out['method'] = method
+                out['result'] = str(value)
+                out['ok'] = True
+            else:
+                out['error'] = error
+
+        elif action in ('set_breakpoint', 'breakpoint_add', 'bp_add'):
+            target_ea = parse_target_ea(query)
+            if target_ea is None:
+                out['error'] = 'Missing or invalid target for breakpoint'
+            else:
+                method, value, error = call_first(ida_dbg, ['add_bpt', 'request_add_bpt'], target_ea)
+                if method:
+                    out['method'] = method
+                    out['target'] = hex(target_ea)
+                    out['result'] = str(value)
+                    out['ok'] = True
+                else:
+                    out['error'] = error
+
+        elif action in ('clear_breakpoint', 'breakpoint_del', 'bp_del', 'delete_breakpoint'):
+            target_ea = parse_target_ea(query)
+            if target_ea is None:
+                out['error'] = 'Missing or invalid target for breakpoint removal'
+            else:
+                method, value, error = call_first(ida_dbg, ['del_bpt', 'request_del_bpt'], target_ea)
+                if method:
+                    out['method'] = method
+                    out['target'] = hex(target_ea)
+                    out['result'] = str(value)
+                    out['ok'] = True
+                else:
+                    out['error'] = error
+
+        elif action in ('list_breakpoints', 'breakpoints', 'bp_list'):
+            qty_method, qty_value, qty_error = call_first(ida_dbg, ['get_bpt_qty'])
+            breakpoints = []
+            if qty_method:
+                get_n = getattr(ida_dbg, 'getn_bpt', None)
+                if callable(get_n):
+                    for index in range(int(qty_value)):
+                        try:
+                            bpt = get_n(index)
+                        except Exception:
+                            continue
+
+                        ea_value = getattr(bpt, 'ea', None)
+                        if ea_value is None and isinstance(bpt, int):
+                            ea_value = bpt
+                        row = {{'index': index}}
+                        if ea_value is not None:
+                            row['ea'] = hex(int(ea_value))
+                        enabled = getattr(bpt, 'enabled', None)
+                        if enabled is not None:
+                            row['enabled'] = bool(enabled)
+                        breakpoints.append(row)
+                out['method'] = qty_method
+                out['count'] = int(qty_value)
+                out['breakpoints'] = breakpoints
+            else:
+                out['error'] = qty_error
+
+        elif action in ('goto_ip', 'jump_ip', 'focus_ip'):
+            ip_value, ip_method = get_ip_value(ida_dbg)
+            if ip_value is None:
+                out['error'] = 'Unable to resolve instruction pointer'
+            else:
+                try:
+                    import ida_kernwin
+
+                    ip_ea = int(ip_value)
+                    out['ip'] = hex(ip_ea)
+                    out['jumped'] = bool(ida_kernwin.jumpto(ip_ea))
+                    out['method'] = ip_method or 'ida_kernwin.jumpto'
+                except Exception as exc:
+                    out['error'] = str(exc)
+
+        else:
+            out['error'] = 'Unknown debugger action'
+            out['supported_actions'] = [
+                'status',
+                'run',
+                'pause',
+                'step_into',
+                'step_over',
+                'step_out',
+                'set_breakpoint',
+                'clear_breakpoint',
+                'list_breakpoints',
+                'goto_ip',
+            ]
+
+        result = out
 
 else:
     result = {{
@@ -1874,7 +2476,7 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
 
     def _strip_agent_tags(self, text: str) -> str:
         """Remove tool/script/delegate tags from assistant-visible plain text."""
-        return DELEGATE_PATTERN.sub("", IDATOOL_PATTERN.sub("", IDASCRIPT_PATTERN.sub("", text))).strip()
+        return strip_agent_tags(text)
 
     def _resolve_delegate_model(self, agent: str) -> str:
         """Resolve a stable delegate model for the current provider.
@@ -2129,8 +2731,9 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
             if turn == 1 and not current_input.startswith("Script error:") and not current_input.startswith("<script_output"):
                 safe_input = (
                     "[SYSTEM REMINDER: Do NOT summarize API docs. The target binary is loaded in IDA. "
-                    "Prefer <idatool> calls first for discovery and analysis (list_funcs, lookup_funcs, analyze_function, decompile, disasm, xrefs_to). "
+                    "Prefer <idatool> calls first for discovery and analysis (find_main, list_funcs, lookup_funcs, search_strings, analyze_function, decompile, disasm, xrefs_to, jump_to, debugger). "
                     "Use <idascript> with db.* only when idatools cannot complete the task. "
+                    "Use canonical unquoted wrapper syntax: <idatool lookup_funcs>{...}</idatool> and <delegate haiku/3.5-turbo>...</delegate>. "
                     "If you do use scripts, use db.functions.get_function_by_name(...), not get_by_name(...). "
                     "For Go binaries, prioritize main.main and app namespaces before runtime.* to avoid expensive decompiles. "
                     "Import modules (like re) before use. "
@@ -2209,16 +2812,10 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
                 duration_ms=request_elapsed_ms,
             )
 
-            scripts_found = [script.strip() for script in IDASCRIPT_PATTERN.findall(assistant_text)]
-            idatools_found = [
-                (name.strip().lower(), payload.strip())
-                for name, payload in IDATOOL_PATTERN.findall(assistant_text)
-            ]
+            scripts_found = extract_idascripts(assistant_text)
+            idatools_found = extract_idatool_calls(assistant_text)
             model_idatools_found = list(idatools_found)
-            delegations = [
-                (agent.strip(), task.strip())
-                for agent, task in DELEGATE_PATTERN.findall(assistant_text)
-            ]
+            delegations = extract_delegate_calls(assistant_text)
             cleaned = self._strip_agent_tags(assistant_text)
 
             # Keep a compact assistant message in rolling context to reduce token churn.
@@ -2231,11 +2828,11 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
                     f"<idascript>\n{code}\n</idascript>" for code in scripts_found
                 )
                 tool_bundle = "\n\n".join(
-                    f"<idatool name=\"{name}\">\n{payload}\n</idatool>"
+                    f"<idatool {name}>\n{payload}\n</idatool>"
                     for name, payload in idatools_found
                 )
                 delegate_bundle = "\n\n".join(
-                    f"<delegate agent=\"{agent}\">\n{task}\n</delegate>"
+                    f"<delegate {agent}>\n{task}\n</delegate>"
                     for agent, task in delegations
                 )
                 combined_bundle = "\n\n".join(
@@ -2316,7 +2913,7 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
                 self.callback.on_metric("Under-batched turn detected; nudging model to group remaining analysis")
                 current_input = (
                     "[SYSTEM REMINDER: Your previous step was under-batched. "
-                    "In your next response, group remaining analysis into multiple <idatool>/<idascript> calls in a single turn, with idatools first. "
+                    "In your next response, group remaining analysis into multiple <idatool>/<idascript> calls in a single turn, with idatools first. Use unquoted tool tags like <idatool list_funcs>...</idatool>. "
                     "Avoid sequential one-step planning.]\n\n"
                     + current_input
                 )
@@ -2427,15 +3024,9 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
                 # Extract scripts from the response
                 if full_text:
                     combined = "".join(full_text)
-                    scripts_found = IDASCRIPT_PATTERN.findall(combined)
-                    idatools_found = [
-                        (name.strip().lower(), payload.strip())
-                        for name, payload in IDATOOL_PATTERN.findall(combined)
-                    ]
-                    delegations = [
-                        (agent.strip(), task.strip())
-                        for agent, task in DELEGATE_PATTERN.findall(combined)
-                    ]
+                    scripts_found = extract_idascripts(combined)
+                    idatools_found = extract_idatool_calls(combined)
+                    delegations = extract_delegate_calls(combined)
                     logger.info(f"Found {len(scripts_found)} scripts in response")
 
                     executed_idatools = idatools_found

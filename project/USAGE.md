@@ -18,24 +18,40 @@ The plugin supports high-level MCP-style tool tags that are faster and less erro
 Use this format:
 
 ```xml
-<idatool name="tool_name">{"queries": ["main", "0x401000"]}</idatool>
+<idatool tool_name>{"queries": ["main", "0x401000"]}</idatool>
 ```
 
 Available tools:
 - `analyze_function`
+- `debugger`
 - `decompile`
 - `disasm`
+- `find_main`
 - `int_convert`
+- `jump_to`
 - `list_funcs`
 - `lookup_funcs`
+- `search_strings`
 - `xrefs_to`
 
 Batch multiple tool calls in one turn whenever possible:
 
 ```xml
-<idatool name="list_funcs">{"limit": 20, "filter": "main"}</idatool>
-<idatool name="analyze_function">{"queries": ["main"]}</idatool>
-<idatool name="xrefs_to">{"queries": ["main"]}</idatool>
+<idatool list_funcs>{"limit": 20, "filter": "main"}</idatool>
+<idatool find_main>{"queries": ["main.main", "runtime.main"]}</idatool>
+<idatool analyze_function>{"queries": ["main"], "max_lines": 60}</idatool>
+<idatool search_strings>{"queries": ["token", "password", "https://"], "limit": 20}</idatool>
+<idatool jump_to>{"query": "main.main", "view": "pseudocode"}</idatool>
+<idatool xrefs_to>{"queries": ["main"]}</idatool>
+```
+
+Debugger control example:
+
+```xml
+<idatool debugger>{"action": "status"}</idatool>
+<idatool debugger>{"action": "set_breakpoint", "query": "main.main"}</idatool>
+<idatool debugger>{"action": "continue"}</idatool>
+<idatool debugger>{"action": "step_over", "count": 2}</idatool>
 ```
 
 When a high-level tool is insufficient, then use `<idascript>`.

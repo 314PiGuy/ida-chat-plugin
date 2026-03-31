@@ -6,12 +6,14 @@ multi-provider model support for AI-assisted reverse engineering within IDA Pro.
 """
 
 import asyncio
+import html
 import json
 import os
 import re
 import sys
 import time
 from io import StringIO
+from urllib.parse import parse_qs, quote, urlparse
 
 # Signal to core that we're running inside IDA Pro (enables UI interaction API)
 os.environ["IDA_CHAT_INSIDE_IDA"] = "1"
@@ -54,6 +56,7 @@ sys.path.insert(0, str(Path(__file__).parent.resolve()))
 
 from ida_chat_core import IDAChatCore, ChatCallback, test_provider_connection
 from ida_chat_history import MessageHistory
+from ida_chat_patterns import extract_opening_tag_target
 from ida_chat_provider import (
     ProviderConfig,
     SUPPORTED_PROVIDERS,
@@ -1487,6 +1490,107 @@ class IDAChatForm(ida_kernwin.PluginForm):
             text, is_user=False, is_processing=True, msg_type=msg_type
         )
 
+    def _attach_collapsible_link_handler(self, section: CollapsibleSection | None):
+        """Connect in-chat link handlers for one collapsible section."""
+        if not section:
+            return
+        try:
+            section.content_label.linkActivated.connect(self._on_chat_link_activated)
+        except Exception:
+            pass
+
+    def _coerce_ea(self, raw_value) -> int | None:
+        """Parse an address-like value into an integer EA."""
+        if raw_value is None:
+            return None
+        if isinstance(raw_value, int):
+            return raw_value
+
+        text = str(raw_value).strip()
+        if not text:
+            return None
+
+        if re.fullmatch(r"0x[0-9a-fA-F]+", text) or re.fullmatch(r"[0-9]+", text):
+            try:
+                return int(text, 0)
+            except ValueError:
+                return None
+        return None
+
+    def _make_ida_link(self, ea_value, label: str, view: str = "disasm") -> str:
+        """Build one custom in-chat link that navigates IDA on click."""
+        ea = self._coerce_ea(ea_value)
+        safe_label = html.escape(str(label))
+        if ea is None:
+            return safe_label
+
+        ea_text = f"0x{ea:X}"
+        href = f"idachat://jump?ea={quote(ea_text)}&view={quote((view or 'disasm').lower())}"
+        return f'<a href="{href}">{safe_label}</a>'
+
+    def _linkify_tool_output(self, output: str) -> str:
+        """Escape tool JSON and convert hex addresses into clickable IDA links."""
+        escaped = html.escape(output)
+
+        def replace_addr(match: re.Match[str]) -> str:
+            token = match.group(0)
+            jump_link = self._make_ida_link(token, token, view="disasm")
+            pseudo_link = self._make_ida_link(token, "[pseudo]", view="pseudocode")
+            return f"{jump_link} {pseudo_link}"
+
+        return re.sub(r"0x[0-9a-fA-F]+", replace_addr, escaped)
+
+    def _navigate_to_ea(self, ea: int, view: str = "disasm") -> bool:
+        """Navigate IDA to a target EA, optionally preferring pseudocode view."""
+        try:
+            preferred = (view or "disasm").strip().lower()
+            if preferred in {"pseudocode", "pseudo", "decompile"}:
+                open_pseudocode = getattr(ida_kernwin, "open_pseudocode", None)
+                if callable(open_pseudocode):
+                    try:
+                        if open_pseudocode(ea, 0):
+                            return True
+                    except Exception:
+                        pass
+
+                try:
+                    import ida_hexrays
+
+                    hr_open = getattr(ida_hexrays, "open_pseudocode", None)
+                    if callable(hr_open) and hr_open(ea, 0):
+                        return True
+                except Exception:
+                    pass
+
+            return bool(ida_kernwin.jumpto(ea))
+        except Exception as exc:
+            self._log_metric(f"Navigation error: {exc}")
+            return False
+
+    def _on_chat_link_activated(self, href: str):
+        """Handle clickable links embedded in tool output sections."""
+        parsed = urlparse(href or "")
+        if parsed.scheme.lower() != "idachat":
+            return
+
+        action = (parsed.netloc or parsed.path).strip("/").lower()
+        if action not in {"jump", "goto"}:
+            return
+
+        params = parse_qs(parsed.query)
+        raw_ea = (params.get("ea") or [""])[0]
+        view = ((params.get("view") or ["disasm"])[0] or "disasm").lower()
+        ea = self._coerce_ea(raw_ea)
+        if ea is None:
+            self._log_metric(f"Navigation link ignored (invalid EA): {href}")
+            return
+
+        ok = self._navigate_to_ea(ea, view=view)
+        if ok:
+            self._log_metric(f"Navigated via chat link: {view} @ 0x{ea:X}")
+        else:
+            self._log_metric(f"Navigation failed via chat link: {view} @ 0x{ea:X}")
+
     def _reset_stream_wrapper_state(self):
         """Reset parser state for streamed model wrappers."""
         self._stream_tag_buffer = ""
@@ -1500,22 +1604,31 @@ class IDAChatForm(ida_kernwin.PluginForm):
         if self._thinking_message:
             self._on_thinking_done()
 
+        if self._stream_pending:
+            self._flush_stream_text()
+        if self._streaming_active and self._current_message:
+            self._current_message.set_complete()
+            self._current_message = None
+            self._streaming_active = False
+            self._stream_buffer = ""
+
         self._stream_wrapper_kind = kind
         self._stream_wrapper_close_tag = close_tag.lower()
         self._stream_wrapper_buffer = opening_tag
 
         if kind == "idatool":
-            match = re.search(r"name\s*=\s*['\"]([^'\"]+)['\"]", opening_tag, flags=re.IGNORECASE)
-            title = f"Model Tool Call ({match.group(1)})" if match else "Model Tool Call"
+            tool_name = extract_opening_tag_target(opening_tag, "idatool", "name")
+            title = f"Model Tool Call ({tool_name})" if tool_name else "Model Tool Call"
         else:
-            match = re.search(r"agent\s*=\s*['\"]([^'\"]+)['\"]", opening_tag, flags=re.IGNORECASE)
-            title = f"Model Delegate Call ({match.group(1)})" if match else "Model Delegate Call"
+            agent_name = extract_opening_tag_target(opening_tag, "delegate", "agent")
+            title = f"Model Delegate Call ({agent_name})" if agent_name else "Model Delegate Call"
 
         self._stream_wrapper_section = self.chat_history.add_collapsible(
             title,
             self._stream_wrapper_buffer,
             collapsed=True,
         )
+        self._attach_collapsible_link_handler(self._stream_wrapper_section)
 
     def _append_stream_wrapper_text(self, fragment: str):
         """Append streamed wrapper text to the current collapsible section."""
@@ -1578,6 +1691,20 @@ class IDAChatForm(ida_kernwin.PluginForm):
 
             lowered = self._stream_tag_buffer.lower()
             close_idx = lowered.find(self._stream_wrapper_close_tag)
+
+            next_open_idx = -1
+            for opener, _kind, _closer in wrapper_markers:
+                idx = lowered.find(opener)
+                if idx >= 0 and (next_open_idx < 0 or idx < next_open_idx):
+                    next_open_idx = idx
+
+            if next_open_idx >= 0 and (close_idx < 0 or next_open_idx < close_idx):
+                if next_open_idx > 0:
+                    self._append_stream_wrapper_text(self._stream_tag_buffer[:next_open_idx])
+                self._stream_tag_buffer = self._stream_tag_buffer[next_open_idx:]
+                self._end_stream_wrapper()
+                continue
+
             if close_idx < 0:
                 keep_len = max(0, len(self._stream_wrapper_close_tag) - 1)
                 if len(self._stream_tag_buffer) > keep_len:
@@ -1627,7 +1754,8 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self._add_processing_message(tool_msg, MessageType.TOOL_USE)
         self._log_metric(f"Tool executed: {tool_name} (details: {details[:100]}...)")
         if details.strip():
-            self.chat_history.add_collapsible(f"{tool_name} Details", details, collapsed=True)
+            section = self.chat_history.add_collapsible(f"{tool_name} Details", details, collapsed=True)
+            self._attach_collapsible_link_handler(section)
 
     def _flush_stream_text(self):
         """Flush pending streamed chunks into a single UI update."""
@@ -1660,7 +1788,6 @@ class IDAChatForm(ida_kernwin.PluginForm):
 
     def _on_script_code(self, code: str):
         """Called with script code before execution."""
-        import html
         self._flush_stream_tag_parser()
         self._flush_stream_text()
         self._streaming_active = False
@@ -1672,7 +1799,8 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self.progress_timeline.add_stage(f"Script {self._script_count}")
         self._log_metric(f"Executing script {self._script_count} ({len(code)} bytes)")
         self._add_processing_message(f"Executing script {self._script_count}", MessageType.SCRIPT)
-        self.chat_history.add_collapsible(f"Script {self._script_count} Code", html.escape(code), collapsed=True)
+        section = self.chat_history.add_collapsible(f"Script {self._script_count} Code", html.escape(code), collapsed=True)
+        self._attach_collapsible_link_handler(section)
 
     def _on_script_output(self, output: str):
         """Called with script output."""
@@ -1688,7 +1816,9 @@ class IDAChatForm(ida_kernwin.PluginForm):
                 if self._current_message:
                     self._current_message.set_complete()
                 title = "Tool Output" if is_tool_json else "Script Output"
-                self.chat_history.add_collapsible(title, output, collapsed=True)
+                display_output = self._linkify_tool_output(output) if is_tool_json else output
+                section = self.chat_history.add_collapsible(title, display_output, collapsed=True)
+                self._attach_collapsible_link_handler(section)
                 self._current_message = None
 
     def _on_error(self, error: str):
