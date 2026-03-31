@@ -1575,6 +1575,28 @@ print(json.dumps(results, ensure_ascii=False))
             "search_string": "search_strings",
             "find_strings": "search_strings",
             "string_search": "search_strings",
+            "segments": "list_segments",
+            "segment_list": "list_segments",
+            "entries": "list_entries",
+            "entrypoints": "list_entries",
+            "entry_points": "list_entries",
+            "symbols": "list_names",
+            "symbol_list": "list_names",
+            "find_symbols": "list_names",
+            "scan_bytes": "find_bytes",
+            "search_bytes": "find_bytes",
+            "hexdump": "hexdump",
+            "dump_bytes": "hexdump",
+            "range_disasm": "disasm_range",
+            "disassemble_range": "disasm_range",
+            "cfg": "flowchart",
+            "control_flow": "flowchart",
+            "locals": "list_locals",
+            "list_local_vars": "list_locals",
+            "rename": "rename_symbol",
+            "rename_function": "rename_symbol",
+            "comment": "set_comment",
+            "set_func_comment": "set_comment",
             "jump": "jump_to",
             "goto": "jump_to",
             "go_to": "jump_to",
@@ -1998,6 +2020,570 @@ elif tool == 'xrefs_to':
             }})
         rows.append({{'query': query, 'target': hex(ea), 'count': len(xrefs), 'xrefs': xrefs[:200]}})
     result = {{'tool': tool, 'results': rows}}
+
+elif tool == 'list_segments':
+    limit = 40
+    offset = 0
+    name_filter = ''
+    class_filter = ''
+    if isinstance(payload, dict):
+        limit = int(payload.get('limit', limit))
+        offset = int(payload.get('offset', offset))
+        name_filter = str(payload.get('filter', payload.get('name', ''))).strip().lower()
+        class_filter = str(payload.get('class', payload.get('segment_class', ''))).strip().lower()
+
+    limit = max(1, min(limit, 400))
+    offset = max(0, offset)
+
+    rows = []
+    for seg in db.segments:
+        try:
+            seg_name = str(db.segments.get_name(seg) or '')
+            seg_class = str(db.segments.get_class(seg) or '')
+            if name_filter and name_filter not in seg_name.lower():
+                continue
+            if class_filter and class_filter != seg_class.lower():
+                continue
+            rows.append({{
+                'name': seg_name,
+                'start_ea': hex(seg.start_ea),
+                'end_ea': hex(seg.end_ea),
+                'size': int(db.segments.get_size(seg)),
+                'class': seg_class,
+                'bitness': int(db.segments.get_bitness(seg)),
+                'comment': str(db.segments.get_comment(seg) or ''),
+            }})
+        except Exception:
+            continue
+
+    selected = rows[offset:offset + limit]
+    result = {{'tool': tool, 'count': len(selected), 'total': len(rows), 'results': selected}}
+
+elif tool == 'list_entries':
+    limit = 80
+    offset = 0
+    name_filter = ''
+    if isinstance(payload, dict):
+        limit = int(payload.get('limit', limit))
+        offset = int(payload.get('offset', offset))
+        name_filter = str(payload.get('filter', payload.get('name', ''))).strip().lower()
+
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+
+    rows = []
+    for entry in db.entries:
+        try:
+            name = str(getattr(entry, 'name', '') or '')
+            if name_filter and name_filter not in name.lower():
+                continue
+
+            row = {{
+                'name': name,
+                'address': hex(int(getattr(entry, 'address', 0))),
+                'ordinal': int(getattr(entry, 'ordinal', 0)),
+            }}
+
+            has_forwarder = getattr(entry, 'has_forwarder', None)
+            if callable(has_forwarder) and has_forwarder():
+                row['forwarder'] = str(getattr(entry, 'forwarder_name', '') or '')
+
+            rows.append(row)
+        except Exception:
+            continue
+
+    selected = rows[offset:offset + limit]
+    result = {{'tool': tool, 'count': len(selected), 'total': len(rows), 'results': selected}}
+
+elif tool == 'list_names':
+    limit = 120
+    offset = 0
+    name_filter = ''
+    regex_filter = ''
+    regex_error = ''
+    if isinstance(payload, dict):
+        limit = int(payload.get('limit', limit))
+        offset = int(payload.get('offset', offset))
+        name_filter = str(payload.get('filter', payload.get('name', payload.get('query', '')))).strip().lower()
+        regex_filter = str(payload.get('filter_regex', payload.get('regex', ''))).strip()
+
+    limit = max(1, min(limit, 1000))
+    offset = max(0, offset)
+
+    matcher = None
+    if regex_filter:
+        try:
+            matcher = re.compile(regex_filter, re.IGNORECASE)
+        except Exception as exc:
+            regex_error = str(exc)
+
+    rows = []
+    for ea, name in db.names:
+        try:
+            symbol = str(name or '')
+            if name_filter and name_filter not in symbol.lower():
+                continue
+            if matcher and not matcher.search(symbol):
+                continue
+            rows.append({{'ea': hex(int(ea)), 'name': symbol}})
+        except Exception:
+            continue
+
+    selected = rows[offset:offset + limit]
+    result = {{'tool': tool, 'count': len(selected), 'total': len(rows), 'results': selected}}
+    if regex_error:
+        result['regex_error'] = regex_error
+
+elif tool == 'find_bytes':
+    mode = 'hex'
+    pattern = ''
+    limit = 80
+    offset = 0
+    if isinstance(payload, dict):
+        mode = str(payload.get('mode', payload.get('type', mode))).strip().lower() or 'hex'
+        pattern = str(payload.get('pattern', payload.get('query', payload.get('value', '')))).strip()
+        limit = int(payload.get('limit', limit))
+        offset = int(payload.get('offset', offset))
+    elif isinstance(payload, str):
+        pattern = payload.strip()
+
+    limit = max(1, min(limit, 1000))
+    offset = max(0, offset)
+
+    rows = []
+    total = 0
+
+    if mode in ('hex', 'bytes', 'binary'):
+        cleaned = pattern.replace('\\\\x', '').replace('0x', '').replace(' ', '').replace('_', '')
+        if not cleaned:
+            result = {{'tool': tool, 'error': 'Missing hex pattern'}}
+        else:
+            if len(cleaned) % 2:
+                cleaned = '0' + cleaned
+            try:
+                needle = bytes.fromhex(cleaned)
+            except Exception as exc:
+                result = {{'tool': tool, 'error': f'Invalid hex pattern: {{exc}}'}}
+            else:
+                matches = list(db.bytes.find_binary_sequence(needle))
+                total = len(matches)
+                for ea in matches[offset:offset + limit]:
+                    rows.append({{'ea': hex(int(ea))}})
+                result = {{
+                    'tool': tool,
+                    'mode': mode,
+                    'pattern': pattern,
+                    'needle_len': len(needle),
+                    'count': len(rows),
+                    'total_matches': total,
+                    'results': rows,
+                }}
+
+    elif mode in ('text', 'string'):
+        if not pattern:
+            result = {{'tool': tool, 'error': 'Missing text pattern'}}
+        else:
+            ea = db.bytes.find_text_between(pattern)
+            if ea is None:
+                result = {{'tool': tool, 'mode': mode, 'pattern': pattern, 'count': 0, 'results': []}}
+            else:
+                try:
+                    ea_int = int(ea)
+                except Exception:
+                    ea_int = -1
+                if ea_int < 0:
+                    result = {{'tool': tool, 'mode': mode, 'pattern': pattern, 'count': 0, 'results': []}}
+                else:
+                    result = {{
+                        'tool': tool,
+                        'mode': mode,
+                        'pattern': pattern,
+                        'count': 1,
+                        'results': [{{'ea': hex(ea_int)}}],
+                    }}
+
+    elif mode in ('immediate', 'imm'):
+        if not pattern:
+            result = {{'tool': tool, 'error': 'Missing immediate value'}}
+        else:
+            try:
+                value = int(pattern, 0)
+            except Exception as exc:
+                result = {{'tool': tool, 'error': f'Invalid immediate value: {{exc}}'}}
+            else:
+                ea = db.bytes.find_immediate_between(value)
+                if ea is None:
+                    result = {{'tool': tool, 'mode': mode, 'value': value, 'count': 0, 'results': []}}
+                else:
+                    try:
+                        ea_int = int(ea)
+                    except Exception:
+                        ea_int = -1
+                    if ea_int < 0:
+                        result = {{'tool': tool, 'mode': mode, 'value': value, 'count': 0, 'results': []}}
+                    else:
+                        result = {{
+                            'tool': tool,
+                            'mode': mode,
+                            'value': value,
+                            'count': 1,
+                            'results': [{{'ea': hex(ea_int)}}],
+                        }}
+
+    else:
+        result = {{'tool': tool, 'error': 'Unknown find_bytes mode', 'mode': mode}}
+
+elif tool == 'hexdump':
+    query = ''
+    length = 128
+    width = 16
+    if isinstance(payload, dict):
+        q = as_query_list(payload)
+        if q:
+            query = q[0]
+        if not query:
+            query = str(payload.get('query', payload.get('ea', payload.get('address', '')))).strip()
+        length = int(payload.get('length', payload.get('size', length)))
+        width = int(payload.get('width', width))
+    elif isinstance(payload, str):
+        query = payload.strip()
+
+    length = max(1, min(length, 4096))
+    width = max(4, min(width, 32))
+
+    target_ea = None
+    func = None
+    if query:
+        try:
+            target_ea = int(query, 0)
+        except Exception:
+            func = resolve_func(query)
+            if func:
+                target_ea = int(func.start_ea)
+
+    if target_ea is None:
+        result = {{'tool': tool, 'error': 'Invalid or missing address/function'}}
+    else:
+        data = db.bytes.get_bytes_at(target_ea, length)
+        if data is None:
+            data = b''
+        if isinstance(data, str):
+            data = data.encode('latin-1', errors='replace')
+
+        lines = []
+        pad = width * 3
+        for index in range(0, len(data), width):
+            chunk = data[index:index + width]
+            hex_part = ' '.join(f"{{b:02X}}" for b in chunk)
+            ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+            lines.append("0x%08X: %-*s %s" % (target_ea + index, pad, hex_part, ascii_part))
+
+        result = {{
+            'tool': tool,
+            'query': query,
+            'target': hex(target_ea),
+            'length': len(data),
+            'hexdump': '\\n'.join(lines),
+        }}
+
+elif tool == 'disasm_range':
+    start_ea = None
+    end_ea = None
+    span = 0x100
+    max_instructions = 220
+    query = ''
+
+    if isinstance(payload, dict):
+        start_raw = payload.get('start', payload.get('start_ea'))
+        end_raw = payload.get('end', payload.get('end_ea'))
+        span = int(payload.get('span', span))
+        max_instructions = int(payload.get('limit', payload.get('max_instructions', max_instructions)))
+
+        if start_raw is not None:
+            try:
+                start_ea = int(str(start_raw), 0)
+            except Exception:
+                start_ea = None
+        if end_raw is not None:
+            try:
+                end_ea = int(str(end_raw), 0)
+            except Exception:
+                end_ea = None
+
+        q = as_query_list(payload)
+        if q:
+            query = q[0]
+    elif isinstance(payload, str):
+        query = payload.strip()
+
+    if start_ea is None and query:
+        try:
+            start_ea = int(query, 0)
+        except Exception:
+            func = resolve_func(query)
+            if func:
+                start_ea = int(func.start_ea)
+                end_ea = int(func.end_ea)
+
+    if start_ea is None:
+        result = {{'tool': tool, 'error': 'Missing start address/function'}}
+    else:
+        span = max(0x10, min(span, 0x2000))
+        max_instructions = max(1, min(max_instructions, 1000))
+        if end_ea is None:
+            end_ea = start_ea + span
+        if end_ea < start_ea:
+            start_ea, end_ea = end_ea, start_ea
+
+        rows = []
+        for insn in db.instructions.get_between(start_ea, end_ea):
+            try:
+                rows.append({{
+                    'ea': hex(int(insn.ea)),
+                    'mnemonic': str(db.instructions.get_mnemonic(insn)),
+                    'disassembly': str(db.instructions.get_disassembly(insn)),
+                }})
+            except Exception:
+                continue
+            if len(rows) >= max_instructions:
+                break
+
+        result = {{
+            'tool': tool,
+            'start_ea': hex(start_ea),
+            'end_ea': hex(end_ea),
+            'count': len(rows),
+            'results': rows,
+        }}
+
+elif tool == 'flowchart':
+    queries = as_query_list(payload)
+    max_blocks = 80
+    if isinstance(payload, dict):
+        max_blocks = int(payload.get('max_blocks', max_blocks))
+    max_blocks = max(1, min(max_blocks, 400))
+
+    if not queries:
+        queries = ['main.main', 'main']
+
+    func = None
+    resolved_query = ''
+    for query in queries:
+        func = resolve_func(query)
+        if func:
+            resolved_query = query
+            break
+
+    if not func:
+        result = {{'tool': tool, 'error': 'Function not found', 'queries': queries}}
+    else:
+        try:
+            fc = db.functions.get_flowchart(func)
+            blocks = list(fc)
+            rows = []
+            edge_count = 0
+            for block in blocks[:max_blocks]:
+                successors = []
+                predecessors = []
+                try:
+                    successors = [int(getattr(s, 'id', -1)) for s in list(block.get_successors())[:12]]
+                except Exception:
+                    successors = []
+                try:
+                    predecessors = [int(getattr(p, 'id', -1)) for p in list(block.get_predecessors())[:12]]
+                except Exception:
+                    predecessors = []
+
+                edge_count += len(successors)
+                rows.append({{
+                    'id': int(getattr(block, 'id', -1)),
+                    'start_ea': hex(int(getattr(block, 'start_ea', 0))),
+                    'end_ea': hex(int(getattr(block, 'end_ea', 0))),
+                    'successors': [sid for sid in successors if sid >= 0],
+                    'predecessors': [pid for pid in predecessors if pid >= 0],
+                }})
+
+            result = {{
+                'tool': tool,
+                'query': resolved_query,
+                'name': db.functions.get_name(func),
+                'start_ea': hex(func.start_ea),
+                'end_ea': hex(func.end_ea),
+                'block_count': len(blocks),
+                'edge_count': edge_count,
+                'shown_blocks': len(rows),
+                'results': rows,
+            }}
+        except Exception as exc:
+            result = {{'tool': tool, 'error': str(exc)}}
+
+elif tool == 'list_locals':
+    queries = as_query_list(payload)
+    include_refs = False
+    max_locals = 120
+    max_refs = 40
+    if isinstance(payload, dict):
+        include_refs = bool(payload.get('include_refs', payload.get('refs', False)))
+        max_locals = int(payload.get('limit', payload.get('max_locals', max_locals)))
+        max_refs = int(payload.get('max_refs', max_refs))
+
+    max_locals = max(1, min(max_locals, 500))
+    max_refs = max(1, min(max_refs, 200))
+
+    if not queries:
+        queries = ['main.main', 'main']
+
+    func = None
+    resolved_query = ''
+    for query in queries:
+        func = resolve_func(query)
+        if func:
+            resolved_query = query
+            break
+
+    if not func:
+        result = {{'tool': tool, 'error': 'Function not found', 'queries': queries}}
+    else:
+        rows = []
+        try:
+            locals_list = list(db.functions.get_local_variables(func))
+        except Exception as exc:
+            result = {{'tool': tool, 'error': str(exc)}}
+        else:
+            for lvar in locals_list[:max_locals]:
+                row = {{
+                    'name': str(getattr(lvar, 'name', '')),
+                    'type': str(getattr(lvar, 'type_str', '')),
+                    'is_argument': bool(getattr(lvar, 'is_argument', False)),
+                }}
+
+                if include_refs:
+                    try:
+                        refs = list(db.functions.get_local_variable_references(func, lvar))
+                        row['refs_count'] = len(refs)
+                        row['refs'] = [
+                            {{
+                                'line': int(getattr(ref, 'line_number', -1)),
+                                'access': str(getattr(getattr(ref, 'access_type', ''), 'name', getattr(ref, 'access_type', ''))),
+                                'context': str(getattr(ref, 'context', '')),
+                            }}
+                            for ref in refs[:max_refs]
+                        ]
+                    except Exception as exc:
+                        row['refs_error'] = str(exc)
+
+                rows.append(row)
+
+            result = {{
+                'tool': tool,
+                'query': resolved_query,
+                'name': db.functions.get_name(func),
+                'start_ea': hex(func.start_ea),
+                'count': len(rows),
+                'total_locals': len(locals_list),
+                'results': rows,
+            }}
+
+elif tool == 'rename_symbol':
+    query = ''
+    new_name = ''
+    force = False
+    if isinstance(payload, dict):
+        query = str(payload.get('query', payload.get('ea', payload.get('address', payload.get('name', ''))))).strip()
+        new_name = str(payload.get('new_name', payload.get('name_to', ''))).strip()
+        force = bool(payload.get('force', False))
+    elif isinstance(payload, str):
+        query = payload.strip()
+
+    target_ea = None
+    if query:
+        try:
+            target_ea = int(query, 0)
+        except Exception:
+            func = resolve_func(query)
+            if func:
+                target_ea = int(func.start_ea)
+            else:
+                for ea, name in db.names:
+                    if str(name or '') == query:
+                        target_ea = int(ea)
+                        break
+
+    if target_ea is None:
+        result = {{'tool': tool, 'error': 'Missing or invalid symbol target'}}
+    elif not new_name:
+        result = {{'tool': tool, 'error': 'Missing new_name'}}
+    else:
+        old_name = str(db.names.get_at(target_ea) or '')
+        try:
+            if force and hasattr(db.names, 'force_name'):
+                ok = bool(db.names.force_name(target_ea, new_name))
+                method = 'force_name'
+            else:
+                ok = bool(db.names.set_name(target_ea, new_name))
+                method = 'set_name'
+            final_name = str(db.names.get_at(target_ea) or '')
+            result = {{
+                'tool': tool,
+                'target': hex(target_ea),
+                'old_name': old_name,
+                'new_name': new_name,
+                'final_name': final_name,
+                'ok': ok,
+                'method': method,
+            }}
+        except Exception as exc:
+            result = {{'tool': tool, 'error': str(exc), 'target': hex(target_ea)}}
+
+elif tool == 'set_comment':
+    query = ''
+    comment_text = ''
+    repeatable = False
+    if isinstance(payload, dict):
+        query = str(payload.get('query', payload.get('ea', payload.get('address', '')))).strip()
+        comment_text = str(payload.get('comment', payload.get('text', '')))
+        repeatable = bool(payload.get('repeatable', False))
+    elif isinstance(payload, str):
+        query = payload.strip()
+
+    target_ea = None
+    if query:
+        try:
+            target_ea = int(query, 0)
+        except Exception:
+            func = resolve_func(query)
+            if func:
+                target_ea = int(func.start_ea)
+
+    if target_ea is None:
+        result = {{'tool': tool, 'error': 'Missing or invalid address/function target'}}
+    elif not comment_text:
+        result = {{'tool': tool, 'error': 'Missing comment text'}}
+    else:
+        try:
+            used_repeatable = False
+            if repeatable:
+                try:
+                    from ida_domain.comments import CommentKind
+
+                    db.comments.set_at(target_ea, comment_text, CommentKind.REPEATABLE)
+                    used_repeatable = True
+                except Exception:
+                    db.comments.set_at(target_ea, comment_text)
+            else:
+                db.comments.set_at(target_ea, comment_text)
+
+            info = db.comments.get_at(target_ea)
+            saved = str(getattr(info, 'comment', comment_text)) if info else comment_text
+            result = {{
+                'tool': tool,
+                'target': hex(target_ea),
+                'repeatable': used_repeatable,
+                'comment': saved,
+                'ok': True,
+            }}
+        except Exception as exc:
+            result = {{'tool': tool, 'error': str(exc), 'target': hex(target_ea)}}
 
 elif tool == 'jump_to':
     queries = as_query_list(payload)
@@ -2731,7 +3317,7 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
             if turn == 1 and not current_input.startswith("Script error:") and not current_input.startswith("<script_output"):
                 safe_input = (
                     "[SYSTEM REMINDER: Do NOT summarize API docs. The target binary is loaded in IDA. "
-                    "Prefer <idatool> calls first for discovery and analysis (find_main, list_funcs, lookup_funcs, search_strings, analyze_function, decompile, disasm, xrefs_to, jump_to, debugger). "
+                    "Prefer <idatool> calls first for discovery and analysis (find_main, list_funcs, lookup_funcs, list_segments, list_entries, list_names, search_strings, find_bytes, hexdump, disasm_range, analyze_function, flowchart, list_locals, decompile, disasm, xrefs_to, rename_symbol, set_comment, jump_to, debugger). "
                     "Use <idascript> with db.* only when idatools cannot complete the task. "
                     "Use canonical unquoted wrapper syntax: <idatool lookup_funcs>{...}</idatool> and <delegate haiku/3.5-turbo>...</delegate>. "
                     "If you do use scripts, use db.functions.get_function_by_name(...), not get_by_name(...). "

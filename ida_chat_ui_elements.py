@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import re
 import time
 
@@ -296,6 +297,7 @@ class ChatMessage(QFrame):
         self.is_user = is_user
         self._is_processing = is_processing
         self._msg_type = msg_type if not is_user else MessageType.USER
+        self._raw_text = text
         self._blink_visible = True
         self._blink_timer = None
         self._status_indicator = None
@@ -396,7 +398,10 @@ class ChatMessage(QFrame):
                 """)
             else:
                 # Default text styling
-                self.message_widget.setText(markdown_to_html(text))
+                if self._is_processing:
+                    self.message_widget.setText(self._render_stream_text(text))
+                else:
+                    self.message_widget.setText(markdown_to_html(text))
                 self.message_widget.setStyleSheet(f"""
                     QLabel {{
                         background-color: {colors['alt_base']};
@@ -450,13 +455,23 @@ class ChatMessage(QFrame):
         self._is_processing = False
         self._stop_blinking()
         self._update_indicator_style()
+        if not self.is_user and self._msg_type == MessageType.TEXT:
+            self.message_widget.setText(markdown_to_html(self._raw_text))
+
+    def _render_stream_text(self, text: str) -> str:
+        """Render lightweight streaming text without full markdown conversion."""
+        return html.escape(text).replace("\n", "<br>")
 
     def update_text(self, text: str):
         """Update the message text."""
+        self._raw_text = text
         if self.is_user:
             self.message_widget.setText(text)
         else:
-            self.message_widget.setText(markdown_to_html(text))
+            if self._msg_type == MessageType.TEXT and self._is_processing:
+                self.message_widget.setText(self._render_stream_text(text))
+            else:
+                self.message_widget.setText(markdown_to_html(text))
 
 
 class ChatHistoryWidget(QScrollArea):
@@ -507,6 +522,15 @@ class ChatHistoryWidget(QScrollArea):
         QTimer.singleShot(10, lambda: self.verticalScrollBar().setValue(
             self.verticalScrollBar().maximum()
         ))
+
+    def scroll_to_bottom_now(self):
+        """Immediately scroll to the bottom without timer queuing."""
+        self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+
+    def is_near_bottom(self, threshold: int = 60) -> bool:
+        """Return whether viewport is close enough to bottom to auto-stick."""
+        bar = self.verticalScrollBar()
+        return (bar.maximum() - bar.value()) <= max(0, threshold)
 
     def add_collapsible(self, title: str, content: str, collapsed: bool = True) -> CollapsibleSection:
         """Add a collapsible section to the chat history."""

@@ -26,12 +26,22 @@ Available tools:
 - `debugger`
 - `decompile`
 - `disasm`
+- `disasm_range`
+- `find_bytes`
 - `find_main`
+- `flowchart`
+- `hexdump`
 - `int_convert`
 - `jump_to`
+- `list_entries`
 - `list_funcs`
+- `list_locals`
+- `list_names`
+- `list_segments`
 - `lookup_funcs`
+- `rename_symbol`
 - `search_strings`
+- `set_comment`
 - `xrefs_to`
 
 Batch multiple tool calls in one turn whenever possible:
@@ -41,6 +51,16 @@ Batch multiple tool calls in one turn whenever possible:
 <idatool find_main>{"queries": ["main.main", "runtime.main"]}</idatool>
 <idatool analyze_function>{"queries": ["main"], "max_lines": 60}</idatool>
 <idatool search_strings>{"queries": ["token", "password", "https://"], "limit": 20}</idatool>
+<idatool list_segments>{"limit": 20}</idatool>
+<idatool list_entries>{"limit": 20}</idatool>
+<idatool list_names>{"filter_regex": "(main|init|auth|crypto)", "limit": 40}</idatool>
+<idatool find_bytes>{"mode": "hex", "pattern": "55 48 89 E5", "limit": 20}</idatool>
+<idatool hexdump>{"query": "0x401000", "length": 128, "width": 16}</idatool>
+<idatool disasm_range>{"start_ea": "0x401000", "end_ea": "0x401120", "limit": 80}</idatool>
+<idatool flowchart>{"query": "main.main", "max_blocks": 120}</idatool>
+<idatool list_locals>{"query": "main.main", "include_refs": true}</idatool>
+<idatool rename_symbol>{"query": "0x401000", "new_name": "entry_dispatch"}</idatool>
+<idatool set_comment>{"query": "0x401000", "comment": "Entry dispatch routine"}</idatool>
 <idatool jump_to>{"query": "main.main", "view": "pseudocode"}</idatool>
 <idatool xrefs_to>{"queries": ["main"]}</idatool>
 ```

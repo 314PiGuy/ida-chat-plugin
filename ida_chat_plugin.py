@@ -967,7 +967,7 @@ class IDAChatForm(ida_kernwin.PluginForm):
 
         self._stream_flush_timer = QTimer(self.parent)
         self._stream_flush_timer.setSingleShot(True)
-        self._stream_flush_timer.setInterval(80)
+        self._stream_flush_timer.setInterval(120)
         self._stream_flush_timer.timeout.connect(self._flush_stream_text)
 
         # Allow horizontal resizing (IDA remembers preferred size)
@@ -1765,6 +1765,8 @@ class IDAChatForm(ida_kernwin.PluginForm):
         if self._thinking_message:
             self._on_thinking_done()
 
+        stick_to_bottom = self.chat_history.is_near_bottom()
+
         if self._streaming_active and self._current_message:
             self._stream_buffer += self._stream_pending
             self._current_message.update_text(self._stream_buffer)
@@ -1772,6 +1774,9 @@ class IDAChatForm(ida_kernwin.PluginForm):
             self._streaming_active = True
             self._stream_buffer = self._stream_pending
             self._add_processing_message(self._stream_buffer)
+
+        if stick_to_bottom:
+            self.chat_history.scroll_to_bottom_now()
 
         self._stream_pending = ""
 
