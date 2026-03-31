@@ -5,9 +5,24 @@ Chat interface for IDA Pro powered by Claude Agent SDK.
 ## Project Structure
 
 ```
-ida_chat_core.py      # Shared: Agent SDK, script execution, agentic loop
-ida_chat_cli.py       # CLI: terminal I/O, arg parsing
-ida_chat_plugin.py    # Plugin: Qt UI, IDA integration, markdown rendering
+ida_chat/             # Modular package
+  core.py             # Shared runtime: agent loop, script/tool execution
+  cli.py              # CLI runtime implementation
+  plugin.py           # IDA plugin runtime implementation
+  history.py          # Message history persistence
+  logging_utils.py    # Shared logger setup
+  providers/
+    config.py         # Provider normalization, env wiring, defaults
+  tools/
+    patterns.py       # <idascript>/<idatool>/<delegate> regex extraction
+    catalog.py        # Built-in idatool catalog
+  ui/
+    elements.py       # Reusable Qt widgets and UI primitives
+ida_chat_core.py      # Compatibility wrapper -> ida_chat.core
+ida_chat_cli.py       # Compatibility wrapper -> ida_chat.cli
+ida_chat_plugin.py    # Compatibility wrapper -> ida_chat.plugin
+ida_chat_history.py   # Compatibility wrapper -> ida_chat.history
+ida_chat_provider.py  # Compatibility wrapper -> ida_chat.providers.config
 project/              # Agent working directory
   PROMPT.md           # System prompt (loaded at runtime)
   USAGE.md            # API usage patterns and tips
@@ -16,7 +31,7 @@ project/              # Agent working directory
 
 ## Architecture
 
-### Core Module (`ida_chat_core.py`)
+### Core Module (`ida_chat/core.py`)
 
 Shared foundation for CLI and Plugin:
 - `ChatCallback` protocol - abstracts output handling
@@ -25,7 +40,7 @@ Shared foundation for CLI and Plugin:
 - Extracts and executes `<idascript>` blocks
 - Feeds script output back to agent until task complete
 
-### CLI Tool (`ida_chat_cli.py`)
+### CLI Tool (`ida_chat/cli.py`)
 
 Standalone command-line chat for testing outside IDA:
 
@@ -36,7 +51,7 @@ uv run python ida_chat_cli.py <binary.i64> -p "prompt"  # Single prompt
 
 Implements `CLICallback` for terminal output (ANSI colors, `[Thinking...]` indicator).
 
-### IDA Plugin (`ida_chat_plugin.py`)
+### IDA Plugin (`ida_chat/plugin.py`)
 
 Dockable chat widget inside IDA Pro (Ctrl+Shift+C to toggle).
 
@@ -105,7 +120,7 @@ The plugin must be packaged as a zip and installed via `hcli`. **Close IDA befor
 ```bash
 # Redeploy plugin (uninstall old, install new)
 rm -f ida-chat.zip && \
-zip -r ida-chat.zip ida-plugin.json ida_chat_plugin.py ida_chat_core.py ida_chat_history.py ida_chat_provider.py splash.png project/ && \
+zip -r ida-chat.zip ida-plugin.json ida_chat_plugin.py ida_chat_core.py ida_chat_history.py ida_chat_provider.py ida_chat/ splash.png project/ && \
 hcli plugin uninstall ida-chat && \
 hcli plugin install ida-chat.zip --config show_wizard=true
 ```
@@ -113,8 +128,10 @@ hcli plugin install ida-chat.zip --config show_wizard=true
 **Files included in the plugin zip:**
 - `ida-plugin.json` - Plugin manifest
 - `ida_chat_plugin.py` - IDA plugin (Qt UI)
-- `ida_chat_core.py` - Shared core module
-- `ida_chat_history.py` - Message history persistence
+- `ida_chat_core.py` - Compatibility wrapper for core runtime
+- `ida_chat_history.py` - Compatibility wrapper for history runtime
+- `ida_chat_provider.py` - Compatibility wrapper for provider runtime
+- `ida_chat/` - Modular runtime package (core, ui, tools, providers)
 - `splash.png` - Onboarding splash image
 - `project/` - Agent prompts and documentation (PROMPT.md, USAGE.md, API_REFERENCE.md, IDA.md)
 
@@ -122,7 +139,7 @@ hcli plugin install ida-chat.zip --config show_wizard=true
 
 ```bash
 # Build the release zip
-zip -r ida-chat.zip ida-plugin.json ida_chat_plugin.py ida_chat_core.py ida_chat_history.py ida_chat_provider.py project/
+zip -r ida-chat.zip ida-plugin.json ida_chat_plugin.py ida_chat_core.py ida_chat_history.py ida_chat_provider.py ida_chat/ project/
 
 # Create and push the tag
 git tag -a X.Y.Z -m "Release message"
