@@ -15,27 +15,21 @@ https://github.com/user-attachments/assets/4377116d-337e-451a-8b80-85245e7501ce
 
 ## Project Layout
 
-The runtime is now organized as a modular package:
+The runtime is organized as modular top-level files:
 
 ```text
-ida_chat/
-   core.py             # Agent loop, script/tool execution, provider transport
-   plugin.py           # IDA plugin runtime and form lifecycle
-   cli.py              # CLI runtime
-   history.py          # Persistent session history
-   logging_utils.py    # Shared log setup (/tmp/ida-chat.log)
-   providers/config.py # Provider adaptation and environment wiring
-   tools/              # Tool regex/catalog and scripting utilities
-   ui/elements.py      # Reusable Qt widgets/components
-
-ida_chat_plugin.py    # Compatibility wrapper for plugin entrypoint
-ida_chat_core.py      # Compatibility wrapper for core imports
-ida_chat_cli.py       # Compatibility wrapper for CLI entrypoint
-ida_chat_history.py   # Compatibility wrapper for history imports
-ida_chat_provider.py  # Compatibility wrapper for provider imports
+ida_chat_core.py          # Agent loop, script/tool execution, provider transport
+ida_chat_plugin.py        # IDA plugin runtime and form lifecycle
+ida_chat_cli.py           # CLI runtime
+ida_chat_history.py       # Persistent session history
+ida_chat_provider.py      # Provider adaptation and environment wiring
+ida_chat_ui_elements.py   # Reusable Qt widgets/components
+ida_chat_logging_utils.py # Shared log setup (/tmp/ida-chat.log)
+ida_chat_patterns.py      # <idascript>/<idatool>/<delegate> extraction regexes
+ida_chat_tool_catalog.py  # Built-in idatool catalog
 ```
 
-This keeps existing entry points stable while making internals easier to extend and test.
+This keeps the code modular while keeping all runtime modules in the repository root.
 
 ## Requirements
 
