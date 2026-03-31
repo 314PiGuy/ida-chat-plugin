@@ -129,6 +129,12 @@ class CollapsibleSection(QFrame):
         self._update_header_text()
         self._update_content()
 
+    def set_content(self, content: str):
+        """Update section content and refresh preview/header."""
+        self._content = content
+        self._update_header_text()
+        self._update_content()
+
     @staticmethod
     def should_collapse(content: str) -> bool:
         """Check if content should be collapsed."""

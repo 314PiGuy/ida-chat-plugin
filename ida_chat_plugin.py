@@ -951,6 +951,11 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self._streaming_active = False
         self._stream_buffer = ""
         self._stream_pending = ""
+        self._stream_tag_buffer = ""
+        self._stream_wrapper_kind: str | None = None
+        self._stream_wrapper_close_tag = ""
+        self._stream_wrapper_buffer = ""
+        self._stream_wrapper_section: CollapsibleSection | None = None
         self._details_expanded = False
         self._active_session_id: str | None = None
         self._updating_session_list = False
@@ -1429,6 +1434,7 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self._streaming_active = False
         self._stream_buffer = ""
         self._stream_pending = ""
+        self._reset_stream_wrapper_state()
         if self._stream_flush_timer.isActive():
             self._stream_flush_timer.stop()
         # Mark previous message as complete before starting new turn
@@ -1481,12 +1487,140 @@ class IDAChatForm(ida_kernwin.PluginForm):
             text, is_user=False, is_processing=True, msg_type=msg_type
         )
 
+    def _reset_stream_wrapper_state(self):
+        """Reset parser state for streamed model wrappers."""
+        self._stream_tag_buffer = ""
+        self._stream_wrapper_kind = None
+        self._stream_wrapper_close_tag = ""
+        self._stream_wrapper_buffer = ""
+        self._stream_wrapper_section = None
+
+    def _begin_stream_wrapper(self, kind: str, close_tag: str, opening_tag: str):
+        """Start collecting a streamed wrapper into a collapsed details block."""
+        if self._thinking_message:
+            self._on_thinking_done()
+
+        self._stream_wrapper_kind = kind
+        self._stream_wrapper_close_tag = close_tag.lower()
+        self._stream_wrapper_buffer = opening_tag
+
+        if kind == "idatool":
+            match = re.search(r"name\s*=\s*['\"]([^'\"]+)['\"]", opening_tag, flags=re.IGNORECASE)
+            title = f"Model Tool Call ({match.group(1)})" if match else "Model Tool Call"
+        else:
+            match = re.search(r"agent\s*=\s*['\"]([^'\"]+)['\"]", opening_tag, flags=re.IGNORECASE)
+            title = f"Model Delegate Call ({match.group(1)})" if match else "Model Delegate Call"
+
+        self._stream_wrapper_section = self.chat_history.add_collapsible(
+            title,
+            self._stream_wrapper_buffer,
+            collapsed=True,
+        )
+
+    def _append_stream_wrapper_text(self, fragment: str):
+        """Append streamed wrapper text to the current collapsible section."""
+        if not fragment or not self._stream_wrapper_kind:
+            return
+
+        self._stream_wrapper_buffer += fragment
+        if self._stream_wrapper_section:
+            self._stream_wrapper_section.set_content(self._stream_wrapper_buffer)
+
+    def _end_stream_wrapper(self):
+        """Finish the active streamed wrapper capture."""
+        self._stream_wrapper_kind = None
+        self._stream_wrapper_close_tag = ""
+        self._stream_wrapper_buffer = ""
+        self._stream_wrapper_section = None
+
+    def _consume_stream_chunk(self, text: str) -> str:
+        """Split streamed text into visible text and wrapper-detail content."""
+        self._stream_tag_buffer += text
+        visible_parts: list[str] = []
+
+        wrapper_markers = [
+            ("<idatool", "idatool", "</idatool>"),
+            ("<delegate", "delegate", "</delegate>"),
+        ]
+        lookbehind = max(len(marker[0]) for marker in wrapper_markers) - 1
+
+        while self._stream_tag_buffer:
+            if not self._stream_wrapper_kind:
+                lowered = self._stream_tag_buffer.lower()
+                best: tuple[int, str, str, str] | None = None
+                for opener, kind, closer in wrapper_markers:
+                    idx = lowered.find(opener)
+                    if idx >= 0 and (best is None or idx < best[0]):
+                        best = (idx, opener, kind, closer)
+
+                if best is None:
+                    if len(self._stream_tag_buffer) > lookbehind:
+                        keep = self._stream_tag_buffer[-lookbehind:] if lookbehind > 0 else ""
+                        emit_len = len(self._stream_tag_buffer) - len(keep)
+                        if emit_len > 0:
+                            visible_parts.append(self._stream_tag_buffer[:emit_len])
+                        self._stream_tag_buffer = keep
+                    break
+
+                idx, _opener, kind, closer = best
+                if idx > 0:
+                    visible_parts.append(self._stream_tag_buffer[:idx])
+                    self._stream_tag_buffer = self._stream_tag_buffer[idx:]
+
+                open_end = self._stream_tag_buffer.find(">")
+                if open_end < 0:
+                    break
+
+                opening_tag = self._stream_tag_buffer[: open_end + 1]
+                self._begin_stream_wrapper(kind, closer, opening_tag)
+                self._stream_tag_buffer = self._stream_tag_buffer[open_end + 1 :]
+                continue
+
+            lowered = self._stream_tag_buffer.lower()
+            close_idx = lowered.find(self._stream_wrapper_close_tag)
+            if close_idx < 0:
+                keep_len = max(0, len(self._stream_wrapper_close_tag) - 1)
+                if len(self._stream_tag_buffer) > keep_len:
+                    emit_len = len(self._stream_tag_buffer) - keep_len
+                    fragment = self._stream_tag_buffer[:emit_len]
+                    self._append_stream_wrapper_text(fragment)
+                    self._stream_tag_buffer = self._stream_tag_buffer[emit_len:]
+                break
+
+            if close_idx > 0:
+                self._append_stream_wrapper_text(self._stream_tag_buffer[:close_idx])
+
+            close_fragment = self._stream_tag_buffer[
+                close_idx: close_idx + len(self._stream_wrapper_close_tag)
+            ]
+            self._append_stream_wrapper_text(close_fragment)
+            self._stream_tag_buffer = self._stream_tag_buffer[
+                close_idx + len(self._stream_wrapper_close_tag):
+            ]
+            self._end_stream_wrapper()
+
+        return "".join(visible_parts)
+
+    def _flush_stream_tag_parser(self):
+        """Flush any pending parser buffer into visible or wrapper channels."""
+        if self._stream_tag_buffer:
+            if self._stream_wrapper_kind:
+                self._append_stream_wrapper_text(self._stream_tag_buffer)
+            else:
+                self._stream_pending += self._stream_tag_buffer
+            self._stream_tag_buffer = ""
+
+        if self._stream_wrapper_kind:
+            self._end_stream_wrapper()
+
     def _on_tool_use(self, tool_name: str, details: str):
         """Called when agent uses a tool."""
+        self._flush_stream_tag_parser()
         self._flush_stream_text()
         self._streaming_active = False
         self._stream_buffer = ""
         self._stream_pending = ""
+        self._reset_stream_wrapper_state()
         tool_msg = f"[{tool_name}]"
         if details:
             tool_msg += " call"
@@ -1518,17 +1652,21 @@ class IDAChatForm(ida_kernwin.PluginForm):
         if not text:
             return
 
-        self._stream_pending += text
-        if not self._stream_flush_timer.isActive():
-            self._stream_flush_timer.start()
+        visible = self._consume_stream_chunk(text)
+        if visible:
+            self._stream_pending += visible
+            if not self._stream_flush_timer.isActive():
+                self._stream_flush_timer.start()
 
     def _on_script_code(self, code: str):
         """Called with script code before execution."""
         import html
+        self._flush_stream_tag_parser()
         self._flush_stream_text()
         self._streaming_active = False
         self._stream_buffer = ""
         self._stream_pending = ""
+        self._reset_stream_wrapper_state()
         # Update timeline
         self._script_count += 1
         self.progress_timeline.add_stage(f"Script {self._script_count}")
@@ -1539,26 +1677,24 @@ class IDAChatForm(ida_kernwin.PluginForm):
     def _on_script_output(self, output: str):
         """Called with script output."""
         if output.strip():
-            import html
             # Check if this is an error output
             is_error = output.strip().startswith("Script error:")
             is_tool_json = output.lstrip().startswith("{") and '"tool"' in output[:300]
             if is_error:
                 self._last_had_error = True
                 self._add_processing_message(output, MessageType.ERROR)
-            # Use collapsible section for long outputs
-            elif is_tool_json or CollapsibleSection.should_collapse(output):
+            else:
                 # Mark previous message as complete
                 if self._current_message:
                     self._current_message.set_complete()
                 title = "Tool Output" if is_tool_json else "Script Output"
                 self.chat_history.add_collapsible(title, output, collapsed=True)
                 self._current_message = None
-            else:
-                self._add_processing_message(html.escape(output), MessageType.OUTPUT)
 
     def _on_error(self, error: str):
         """Called when an error occurs."""
+        self._flush_stream_tag_parser()
+        self._flush_stream_text()
         self._add_processing_message(f"Error: {error}", MessageType.ERROR)
         self._log_metric(f"ERROR: {error}")
 
@@ -1569,11 +1705,13 @@ class IDAChatForm(ida_kernwin.PluginForm):
 
     def _on_finished(self):
         """Called when agent finishes processing."""
+        self._flush_stream_tag_parser()
         self._flush_stream_text()
         self._is_processing = False
         self._streaming_active = False
         self._stream_buffer = ""
         self._stream_pending = ""
+        self._reset_stream_wrapper_state()
         if hasattr(self, "stop_btn"):
             self.stop_btn.setEnabled(False)
         self._message_count += 1
@@ -1685,8 +1823,9 @@ class IDAChatForm(ida_kernwin.PluginForm):
         header_layout.addWidget(share_btn)
 
         # Stop button
-        self.stop_btn = QPushButton("■")
-        self.stop_btn.setFixedSize(24, 24)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setFixedHeight(24)
+        self.stop_btn.setMinimumWidth(46)
         self.stop_btn.setToolTip("Stop current response")
         self.stop_btn.setStyleSheet(icon_btn_style)
         self.stop_btn.clicked.connect(self._on_cancel)
@@ -2057,6 +2196,7 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self._streaming_active = False
         self._stream_buffer = ""
         self._stream_pending = ""
+        self._reset_stream_wrapper_state()
         if self._stream_flush_timer.isActive():
             self._stream_flush_timer.stop()
         if hasattr(self, "stop_btn"):

@@ -1034,6 +1034,16 @@ class IDAChatCore:
                 "_compat_entry_name(",
                 "Replaced db.entries.get_name(...) with compatibility entry-name helper",
             ),
+            (
+                "db.xrefs.get_xrefs_to(",
+                "db.xrefs.to_ea(",
+                "Replaced db.xrefs.get_xrefs_to(...) with db.xrefs.to_ea(...)",
+            ),
+            (
+                "db.xrefs.get_xrefs_from(",
+                "db.xrefs.from_ea(",
+                "Replaced db.xrefs.get_xrefs_from(...) with db.xrefs.from_ea(...)",
+            ),
         ]
 
         for old, new, description in rewrites:
@@ -1143,6 +1153,22 @@ def _compat_entry_name(entry):
             )
             fixes.append("Injected compatibility helper: _compat_entry_name")
 
+        if "_compat_ea(" in code and "def _compat_ea(" not in code:
+            helper_blocks.append(
+                """
+def _compat_ea(value):
+    if hasattr(value, 'start_ea'):
+        return int(value.start_ea)
+    if hasattr(value, 'ea'):
+        return int(value.ea)
+    try:
+        return int(value)
+    except Exception:
+        return 0
+""".strip()
+            )
+            fixes.append("Injected compatibility helper: _compat_ea")
+
         if not helper_blocks:
             return code, fixes
 
@@ -1174,6 +1200,37 @@ def _compat_entry_name(entry):
         if "object has no attribute 'get_type'" in error_text and "db.segments.get_type(" in normalized:
             normalized = normalized.replace("db.segments.get_type(", "_compat_segment_type(")
             fixes.append("Recovered from segments.get_type error using compatibility segment-type helper")
+
+        if "object has no attribute 'get_xrefs_to'" in error_text and "db.xrefs.get_xrefs_to(" in normalized:
+            normalized = normalized.replace("db.xrefs.get_xrefs_to(", "db.xrefs.to_ea(")
+            fixes.append("Recovered from get_xrefs_to error using db.xrefs.to_ea(...)")
+
+        if "object has no attribute 'get_xrefs_from'" in error_text and "db.xrefs.get_xrefs_from(" in normalized:
+            normalized = normalized.replace("db.xrefs.get_xrefs_from(", "db.xrefs.from_ea(")
+            fixes.append("Recovered from get_xrefs_from error using db.xrefs.from_ea(...)")
+
+        if "object has no attribute 'start_ea'" in error_text:
+            normalized, start_ea_subs = re.subn(
+                r"\b([A-Za-z_][A-Za-z0-9_]*)\.start_ea\b",
+                r"_compat_ea(\1)",
+                normalized,
+            )
+            if start_ea_subs:
+                fixes.append("Recovered from missing start_ea attribute using _compat_ea(...) helper")
+
+        if "unsupported format string passed to func_t.__format__" in error_text:
+            def _format_fix(match: re.Match[str]) -> str:
+                symbol = match.group(1)
+                fmt = match.group(2)
+                return "{" + f"_compat_ea({symbol}):{fmt}" + "}"
+
+            normalized, fmt_subs = re.subn(
+                r"\{([A-Za-z_][A-Za-z0-9_]*)\:(X|x)\}",
+                _format_fix,
+                normalized,
+            )
+            if fmt_subs:
+                fixes.append("Recovered from func_t formatting error by formatting _compat_ea(...) instead")
 
         if "name 're' is not defined" in error_text:
             uses_re = bool(re.search(r"\bre\.", normalized))
@@ -1357,19 +1414,68 @@ print(json.dumps(results, ensure_ascii=False))
         text = payload_text.strip()
         if not text:
             return {}
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            return text
+
+        # Strip common wrappers providers/models add around JSON payloads.
+        text = re.sub(r"^\s*<!\[CDATA\[", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\]\]>\s*$", "", text, flags=re.IGNORECASE)
+        if text.startswith("```"):
+            text = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
+
+        candidate = text
+        for _ in range(3):
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                break
+            if isinstance(parsed, str):
+                candidate = parsed.strip()
+                continue
+            return parsed
+
+        # Try extracting JSON from mixed wrapper text.
+        decoder = json.JSONDecoder()
+        for marker in ("{", "["):
+            start = text.find(marker)
+            if start < 0:
+                continue
+            try:
+                parsed_value, _ = decoder.raw_decode(text[start:])
+            except json.JSONDecodeError:
+                continue
+            return parsed_value
+
+        return text
 
     def _as_query_list(self, payload, key: str = "queries") -> list[str]:
         """Normalize flexible payloads into a list of query strings."""
         if isinstance(payload, str):
-            return [q.strip() for q in payload.split(",") if q.strip()]
+            text = payload.strip()
+            if not text:
+                return []
+
+            parsed = self._parse_tool_payload(text)
+            if parsed is not None and not isinstance(parsed, str):
+                return self._as_query_list(parsed, key)
+
+            # Avoid splitting JSON-like payload fragments into pseudo-queries.
+            if any(ch in text for ch in "{}[]"):
+                return [text]
+            return [q.strip() for q in text.split(",") if q.strip()]
         if isinstance(payload, list):
             return [str(item).strip() for item in payload if str(item).strip()]
         if isinstance(payload, dict):
-            value = payload.get(key) or payload.get("query") or payload.get("addr") or payload.get("name")
+            value = (
+                payload.get(key)
+                or payload.get("query")
+                or payload.get("queries")
+                or payload.get("addr")
+                or payload.get("ea")
+                or payload.get("address")
+                or payload.get("addresses")
+                or payload.get("name")
+            )
             return self._as_query_list(value, key)
         return []
 
@@ -1385,6 +1491,31 @@ print(json.dumps(results, ensure_ascii=False))
         except ValueError:
             return self.db.functions.get_function_by_name(query)
 
+    def _build_tool_first_bootstrap_calls(self, seed_text: str) -> list[tuple[str, str]]:
+        """Build default MCP-style idatool calls for script-only responses."""
+        defaults = [
+            "main",
+            "main.main",
+            "runtime.main",
+            "WinMain",
+            "wmain",
+            "_start",
+            "start",
+            "entry",
+            "init",
+        ]
+        lowered = (seed_text or "").lower()
+        prioritized = [name for name in defaults if name.lower() in lowered]
+        ordered = prioritized + [name for name in defaults if name not in prioritized]
+        queries = ordered[:6]
+
+        query_payload = json.dumps({"queries": queries}, ensure_ascii=False)
+        return [
+            ("list_funcs", json.dumps({"limit": 40}, ensure_ascii=False)),
+            ("lookup_funcs", query_payload),
+            ("analyze_function", query_payload),
+        ]
+
     def _run_idatool(self, tool_name: str, payload_text: str) -> str:
         """Execute a built-in MCP-style IDA tool and return JSON output text.
 
@@ -1396,29 +1527,106 @@ print(json.dumps(results, ensure_ascii=False))
 
         script = f"""
 import json
+import re
 
 tool = {json.dumps(tool)}
 payload = json.loads({json.dumps(json.dumps(payload, ensure_ascii=False))})
 
 def as_query_list(value, key='queries'):
+    def clean_payload_text(text):
+        s = str(text or '').strip()
+        s = re.sub(r'^\\s*<!\\[CDATA\\[', '', s, flags=re.IGNORECASE)
+        s = re.sub(r'\\]\\]>\\s*$', '', s, flags=re.IGNORECASE)
+        if s.startswith('```'):
+            s = re.sub(r'^```[a-zA-Z0-9_-]*\\s*', '', s)
+            s = re.sub(r'\\s*```$', '', s)
+        return s.strip()
+
+    def decode_json_text(text):
+        candidate = clean_payload_text(text)
+        for _ in range(3):
+            if not candidate:
+                return candidate
+            if not (candidate.startswith('{{') or candidate.startswith('[') or candidate.startswith('"')):
+                return candidate
+            try:
+                parsed = json.loads(candidate)
+            except Exception:
+                return candidate
+            if isinstance(parsed, str):
+                candidate = parsed.strip()
+                continue
+            return parsed
+        return candidate
+
     if isinstance(value, str):
-        return [q.strip() for q in value.split(',') if q.strip()]
+        decoded = decode_json_text(value)
+        if isinstance(decoded, (dict, list)):
+            return as_query_list(decoded, key)
+        text = str(decoded).strip()
+        if not text:
+            return []
+        if any(ch in text for ch in '{{}}[]'):
+            return [text]
+        return [q.strip() for q in text.split(',') if q.strip()]
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
     if isinstance(value, dict):
-        v = value.get(key) or value.get('query') or value.get('addr') or value.get('name')
+        v = value.get(key) or value.get('query') or value.get('queries') or value.get('addr') or value.get('ea') or value.get('address') or value.get('addresses') or value.get('name')
         return as_query_list(v, key)
     return []
 
 def resolve_func(query):
     query = str(query).strip()
+    query = re.sub(r'^\\s*<!\\[CDATA\\[', '', query, flags=re.IGNORECASE)
+    query = re.sub(r'\\]\\]>\\s*$', '', query, flags=re.IGNORECASE)
+    query = query.strip().strip('"\'')
     if not query:
         return None
+
+    def normalize_name(name):
+        return re.sub(r'[^a-z0-9]+', '', str(name or '').lower())
+
     try:
         ea = int(query, 0)
         return db.functions.get_at(ea)
     except Exception:
-        return db.functions.get_function_by_name(query)
+        pass
+
+    direct = db.functions.get_function_by_name(query)
+    if direct:
+        return direct
+
+    variant_candidates = [
+        query.replace('/', '_'),
+        query.replace('.', '_'),
+        query.replace('-', '_'),
+        query.replace('_', '.'),
+        query.replace('/', '.'),
+    ]
+    for variant in variant_candidates:
+        if not variant or variant == query:
+            continue
+        func = db.functions.get_function_by_name(variant)
+        if func:
+            return func
+
+    needle = normalize_name(query)
+    if not needle:
+        return None
+
+    fuzzy = None
+    for func in db.functions:
+        try:
+            name = db.functions.get_name(func)
+        except Exception:
+            continue
+        normalized = normalize_name(name)
+        if normalized == needle:
+            return func
+        if needle in normalized and fuzzy is None:
+            fuzzy = func
+    return fuzzy
 
 result = None
 
@@ -1479,13 +1687,31 @@ elif tool == 'list_funcs':
 
 elif tool in ('decompile', 'disasm', 'analyze_function'):
     queries = as_query_list(payload)
-    query = queries[0] if queries else ''
-    func = resolve_func(query)
+    if not queries:
+        queries = ['main', 'main.main', 'runtime.main', 'WinMain', 'wmain', '_start', 'start']
+    attempts = []
+    resolved_query = ''
+    func = None
+    for query in queries:
+        q = str(query).strip()
+        if not q:
+            continue
+        attempts.append(q)
+        func = resolve_func(q)
+        if func:
+            resolved_query = q
+            break
     if not func:
-        result = {{'tool': tool, 'error': f'Function not found: {{query}}'}}
+        attempted = ', '.join(attempts) if attempts else '(none)'
+        result = {{
+            'tool': tool,
+            'error': f'Function not found. Tried: {{attempted}}',
+            'queries': attempts,
+        }}
     else:
         out = {{
             'tool': tool,
+            'query': resolved_query,
             'name': db.functions.get_name(func),
             'start_ea': hex(func.start_ea),
             'end_ea': hex(func.end_ea),
@@ -1903,8 +2129,13 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
             if turn == 1 and not current_input.startswith("Script error:") and not current_input.startswith("<script_output"):
                 safe_input = (
                     "[SYSTEM REMINDER: Do NOT summarize API docs. The target binary is loaded in IDA. "
-                    "Use <idascript> with db.* calls only. Use db.functions.get_function_by_name(...), not get_by_name(...). "
-                    "Import modules (like re) before use.]\n\n"
+                    "Prefer <idatool> calls first for discovery and analysis (list_funcs, lookup_funcs, analyze_function, decompile, disasm, xrefs_to). "
+                    "Use <idascript> with db.* only when idatools cannot complete the task. "
+                    "If you do use scripts, use db.functions.get_function_by_name(...), not get_by_name(...). "
+                    "For Go binaries, prioritize main.main and app namespaces before runtime.* to avoid expensive decompiles. "
+                    "Import modules (like re) before use. "
+                    "Batch aggressively: emit all required <idatool>/<idascript>/<delegate> calls in one response turn when safe. "
+                    "Do not do one tiny discovery step per turn.]\n\n"
                     f"USER REQUEST: {current_input}"
                 )
                 messages.append({"role": "user", "content": safe_input})
@@ -1983,6 +2214,7 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
                 (name.strip().lower(), payload.strip())
                 for name, payload in IDATOOL_PATTERN.findall(assistant_text)
             ]
+            model_idatools_found = list(idatools_found)
             delegations = [
                 (agent.strip(), task.strip())
                 for agent, task in DELEGATE_PATTERN.findall(assistant_text)
@@ -2032,7 +2264,17 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
 
             script_outputs: list[str] = []
 
-            tool_outputs = await self._execute_idatool_calls(idatools_found)
+            executed_idatools = idatools_found
+            if scripts_found and not model_idatools_found and turn <= 3:
+                executed_idatools = self._build_tool_first_bootstrap_calls(
+                    f"{current_input}\n\n{assistant_text}"
+                )
+                if executed_idatools:
+                    self.callback.on_metric(
+                        "Script-only turn detected; injecting tool-first bootstrap idatool batch"
+                    )
+
+            tool_outputs = await self._execute_idatool_calls(executed_idatools)
             if tool_outputs:
                 script_outputs.extend(tool_outputs)
                 all_script_outputs.extend(tool_outputs)
@@ -2049,16 +2291,35 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
                 for index, output in enumerate(final_script_outputs, 1):
                     logger.debug("Script %s output (OpenAI-compatible): %s", index, output[:200])
 
+            operation_count = len(scripts_found) + len(idatools_found) + len(delegations)
+            under_batched = operation_count <= 1 and turn <= 3
+
             if script_outputs:
                 formatted_outputs = []
                 for i, output in enumerate(script_outputs, 1):
                     if len(script_outputs) > 1:
-                        formatted_outputs.append(f"Tool output {i}:\n{output}")
+                        formatted_outputs.append(f"Execution output {i}:\n{output}")
                     else:
                         formatted_outputs.append(output)
-                current_input = "Script output:\n\n" + "\n\n".join(formatted_outputs)
+                current_input = "Execution output:\n\n" + "\n\n".join(formatted_outputs)
             else:
-                current_input = "Script executed successfully with no output."
+                current_input = "Execution completed successfully with no output."
+
+            if scripts_found and not model_idatools_found:
+                current_input = (
+                    "[SYSTEM REMINDER: You used <idascript> without any <idatool> calls. "
+                    "In the next turn, start with a batched idatool plan and only use scripts for gaps.]\n\n"
+                    + current_input
+                )
+
+            if under_batched:
+                self.callback.on_metric("Under-batched turn detected; nudging model to group remaining analysis")
+                current_input = (
+                    "[SYSTEM REMINDER: Your previous step was under-batched. "
+                    "In your next response, group remaining analysis into multiple <idatool>/<idascript> calls in a single turn, with idatools first. "
+                    "Avoid sequential one-step planning.]\n\n"
+                    + current_input
+                )
 
         if turn >= self.max_turns:
             logger.warning("Reached maximum turns (%s)", self.max_turns)
@@ -2177,8 +2438,16 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
                     ]
                     logger.info(f"Found {len(scripts_found)} scripts in response")
 
+                    executed_idatools = idatools_found
+                    if scripts_found and not idatools_found:
+                        executed_idatools = self._build_tool_first_bootstrap_calls(combined)
+                        if executed_idatools:
+                            self.callback.on_metric(
+                                "Script-only response detected; injecting tool-first bootstrap idatool batch"
+                            )
+
                     # Execute idatool calls first (mcp-style high-level tools).
-                    tool_outputs = await self._execute_idatool_calls(idatools_found)
+                    tool_outputs = await self._execute_idatool_calls(executed_idatools)
                     script_outputs.extend(tool_outputs)
 
                     # Execute delegate calls.
@@ -2265,13 +2534,13 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
                 formatted_outputs = []
                 for i, output in enumerate(script_outputs, 1):
                     if len(scripts_found) > 1:
-                        formatted_outputs.append(f"Script {i} output:\n{output}")
+                        formatted_outputs.append(f"Execution {i} output:\n{output}")
                     else:
                         formatted_outputs.append(output)
-                current_input = "Script output:\n\n" + "\n\n".join(formatted_outputs)
+                current_input = "Execution output:\n\n" + "\n\n".join(formatted_outputs)
                 logger.debug(f"Feeding back to agent: {current_input[:200]}...")
             else:
-                current_input = "Script executed successfully with no output."
+                current_input = "Execution completed successfully with no output."
                 logger.debug("Script had no output, notifying agent")
 
         if turn >= self.max_turns:
