@@ -90,6 +90,57 @@ OPENAI_COMPAT_DEFAULT_BASE_URLS = {
     "nim": "https://integrate.api.nvidia.com/v1",
 }
 
+IDATOOL_ALIASES = {
+    "look_up": "lookup_funcs",
+    "lookup": "lookup_funcs",
+    "lookups_funcs": "lookup_funcs",
+    "lookup_function": "lookup_funcs",
+    "lookup_functions": "lookup_funcs",
+    "list_functions": "list_funcs",
+    "search_functions": "list_funcs",
+    "find_functions": "list_funcs",
+    "disassemble": "disasm",
+    "decompile_function": "decompile",
+    "xref_to": "xrefs_to",
+    "xrefs": "xrefs_to",
+    "search_string": "search_strings",
+    "find_strings": "search_strings",
+    "string_search": "search_strings",
+    "segments": "list_segments",
+    "segment_list": "list_segments",
+    "entries": "list_entries",
+    "entrypoints": "list_entries",
+    "entry_points": "list_entries",
+    "symbols": "list_names",
+    "symbol_list": "list_names",
+    "find_symbols": "list_names",
+    "scan_bytes": "find_bytes",
+    "search_bytes": "find_bytes",
+    "hexdump": "hexdump",
+    "dump_bytes": "hexdump",
+    "range_disasm": "disasm_range",
+    "disassemble_range": "disasm_range",
+    "cfg": "flowchart",
+    "control_flow": "flowchart",
+    "locals": "list_locals",
+    "list_local_vars": "list_locals",
+    "rename": "rename_symbol",
+    "rename_function": "rename_symbol",
+    "comment": "set_comment",
+    "set_func_comment": "set_comment",
+    "jump": "jump_to",
+    "goto": "jump_to",
+    "go_to": "jump_to",
+    "navigate": "jump_to",
+    "navigate_to": "jump_to",
+    "focus": "jump_to",
+    "focus_view": "jump_to",
+    "debug": "debugger",
+    "dbg": "debugger",
+    "debug_control": "debugger",
+    "debugger_control": "debugger",
+}
+
 
 
 def get_model_context_length(model: str) -> int:
@@ -291,12 +342,15 @@ def _resolve_openai_compat_base_url(provider_config: ProviderConfig) -> str:
     raise RuntimeError(f"No OpenAI-compatible base URL found for provider '{provider_name}'")
 
 
-def _query_openai_compat_sync(
+def _query_openai_compat_sync_with_meta(
     provider_config: ProviderConfig,
     messages: list[dict[str, str]],
     timeout_seconds: float = 120.0,
-) -> str:
-    """Send a synchronous chat completion request to OpenAI-compatible endpoints."""
+) -> tuple[str, str]:
+    """Send a synchronous chat completion request.
+
+    Returns (assistant_text, finish_reason).
+    """
     provider_name = normalize_provider(provider_config.provider)
     if provider_name == "claude":
         raise RuntimeError("OpenAI-compatible transport should not be used for Claude provider")
@@ -350,14 +404,44 @@ def _query_openai_compat_sync(
     if not assistant_text:
         raise RuntimeError("Provider returned an empty response")
 
+    finish_reason = _extract_openai_compat_finish_reason(response_json)
+    return assistant_text, finish_reason
+
+
+def _query_openai_compat_sync(
+    provider_config: ProviderConfig,
+    messages: list[dict[str, str]],
+    timeout_seconds: float = 120.0,
+) -> str:
+    """Text-only compatibility wrapper for synchronous OpenAI-compatible requests."""
+    assistant_text, _ = _query_openai_compat_sync_with_meta(
+        provider_config,
+        messages,
+        timeout_seconds,
+    )
     return assistant_text
 
 
-def _extract_openai_compat_stream_delta(chunk_json: dict) -> tuple[str, bool]:
+def _extract_openai_compat_finish_reason(payload_json: dict) -> str:
+    """Extract normalized finish_reason from OpenAI-compatible payloads."""
+    choices = payload_json.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+    reason = first.get("finish_reason")
+    if isinstance(reason, str):
+        return reason.strip().lower()
+    return ""
+
+
+def _extract_openai_compat_stream_delta(chunk_json: dict) -> tuple[str, bool, str]:
     """Extract text from one OpenAI-compatible streaming chunk.
 
-    Returns (text, maybe_cumulative_fragment). The second value is True when
-    providers send full message fragments instead of incremental deltas.
+    Returns (text, maybe_cumulative_fragment, finish_reason). The second value
+    is True when providers send full message fragments instead of incremental
+    deltas.
     """
 
     def _extract_text(value) -> str:
@@ -376,6 +460,7 @@ def _extract_openai_compat_stream_delta(chunk_json: dict) -> tuple[str, bool]:
             return "".join(parts)
         return ""
 
+    finish_reason = _extract_openai_compat_finish_reason(chunk_json)
     choices = chunk_json.get("choices")
     if isinstance(choices, list) and choices:
         first_choice = choices[0]
@@ -386,7 +471,7 @@ def _extract_openai_compat_stream_delta(chunk_json: dict) -> tuple[str, bool]:
                 for key in ("content", "text", "reasoning_content"):
                     text = _extract_text(delta.get(key))
                     if text:
-                        return text, False
+                        return text, False, finish_reason
 
             # Some providers stream full message fragments.
             message = first_choice.get("message")
@@ -394,19 +479,19 @@ def _extract_openai_compat_stream_delta(chunk_json: dict) -> tuple[str, bool]:
                 for key in ("content", "text", "reasoning_content"):
                     text = _extract_text(message.get(key))
                     if text:
-                        return text, True
+                        return text, True, finish_reason
 
             text = _extract_text(first_choice.get("text"))
             if text:
-                return text, True
+                return text, True, finish_reason
 
     # Additional compatibility with providers that stream output_text directly.
     for key in ("output_text", "text", "content"):
         text = _extract_text(chunk_json.get(key))
         if text:
-            return text, True
+            return text, True, finish_reason
 
-    return "", False
+    return "", False, finish_reason
 
 
 def _query_openai_compat_stream_sync(
@@ -414,8 +499,11 @@ def _query_openai_compat_stream_sync(
     messages: list[dict[str, str]],
     timeout_seconds: float = 180.0,
     on_chunk: Callable[[str], None] | None = None,
-) -> str:
-    """Send a streaming chat completion request and return the merged text."""
+) -> tuple[str, str]:
+    """Send a streaming chat completion request.
+
+    Returns (merged_text, finish_reason).
+    """
     provider_name = normalize_provider(provider_config.provider)
     if provider_name == "claude":
         raise RuntimeError("Streaming OpenAI-compatible transport should not be used for Claude provider")
@@ -439,6 +527,7 @@ def _query_openai_compat_stream_sync(
     )
 
     parts: list[str] = []
+    finish_reason = ""
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             content_type = str(response.headers.get("Content-Type") or "").lower()
@@ -452,15 +541,17 @@ def _query_openai_compat_stream_sync(
                 assistant_text = _extract_openai_compat_text(response_json).strip()
                 if not assistant_text:
                     raise RuntimeError("Provider returned an empty streaming response")
+                finish_reason = _extract_openai_compat_finish_reason(response_json)
                 if on_chunk:
                     on_chunk(assistant_text)
-                return assistant_text
+                return assistant_text, finish_reason
 
             cumulative_fragment = ""
             event_data_lines: list[str] = []
+            saw_done = False
 
             def _flush_event_data() -> bool:
-                nonlocal cumulative_fragment
+                nonlocal cumulative_fragment, finish_reason
                 if not event_data_lines:
                     return False
 
@@ -483,7 +574,9 @@ def _query_openai_compat_stream_sync(
                 if isinstance(chunk_json, dict) and chunk_json.get("error"):
                     raise RuntimeError(_extract_error_message(json.dumps(chunk_json)))
 
-                chunk_text, maybe_cumulative = _extract_openai_compat_stream_delta(chunk_json)
+                chunk_text, maybe_cumulative, chunk_finish_reason = _extract_openai_compat_stream_delta(chunk_json)
+                if chunk_finish_reason:
+                    finish_reason = chunk_finish_reason
                 if not chunk_text:
                     return False
 
@@ -506,6 +599,7 @@ def _query_openai_compat_stream_sync(
 
                 if not line:
                     if _flush_event_data():
+                        saw_done = True
                         break
                     continue
 
@@ -521,7 +615,11 @@ def _query_openai_compat_stream_sync(
                     event_data_lines.append(line)
 
             if event_data_lines:
-                _flush_event_data()
+                if _flush_event_data():
+                    saw_done = True
+
+            if not saw_done and not finish_reason:
+                raise RuntimeError("Streaming response ended without completion signal")
 
     except urllib.error.HTTPError as http_error:
         body = http_error.read().decode("utf-8", errors="replace")
@@ -542,7 +640,7 @@ def _query_openai_compat_stream_sync(
     merged = "".join(parts).strip()
     if not merged:
         raise RuntimeError("Provider returned an empty streaming response")
-    return merged
+    return merged, finish_reason
 
 
 async def _query_openai_compat(
@@ -559,12 +657,29 @@ async def _query_openai_compat(
     )
 
 
+async def _query_openai_compat_with_meta(
+    provider_config: ProviderConfig,
+    messages: list[dict[str, str]],
+    timeout_seconds: float = 120.0,
+) -> tuple[str, str]:
+    """Run OpenAI-compatible request off the event loop thread.
+
+    Returns (assistant_text, finish_reason).
+    """
+    return await asyncio.to_thread(
+        _query_openai_compat_sync_with_meta,
+        provider_config,
+        messages,
+        timeout_seconds,
+    )
+
+
 async def _query_openai_compat_stream(
     provider_config: ProviderConfig,
     messages: list[dict[str, str]],
     timeout_seconds: float = 180.0,
     on_chunk: Callable[[str], None] | None = None,
-) -> str:
+) -> tuple[str, str]:
     """Run OpenAI-compatible streaming request off the event loop thread."""
     return await asyncio.to_thread(
         _query_openai_compat_stream_sync,
@@ -972,12 +1087,16 @@ class IDAChatCore:
                 lines.append(f"- {role}: {content[:220]}")
         return "\n".join(lines) if lines else "No earlier context to summarize."
 
+    def _estimate_prompt_tokens(self, messages: list[dict[str, str]]) -> float:
+        """Cheap token estimate for capacity decisions."""
+        return sum(len(str(m.get("content", ""))) for m in messages) / 4
+
     def _emit_context_warning_if_needed(self, messages: list[dict[str, str]]) -> None:
         """Warn once when model context is likely too small for the active prompt."""
         model_name = resolve_model(self.provider_config) or self.provider_config.model or "unknown"
         limit = get_model_context_length(model_name)
-        estimated_tokens = sum(len(str(m.get("content", ""))) for m in messages) / 4
-        if estimated_tokens * 2 <= limit:
+        estimated_tokens = self._estimate_prompt_tokens(messages)
+        if estimated_tokens < (limit * 0.9):
             return
         if getattr(self, "_warned_context", False):
             return
@@ -995,7 +1114,7 @@ class IDAChatCore:
                 f"Model: {model_name}\n"
                 f"Estimated prompt tokens: {estimated_tokens:.0f}\n"
                 f"Context limit: {limit}\n"
-                "Reason: limit is less than 2x estimated prompt size."
+                "Reason: estimated prompt reached >=90% of model context window."
             ),
             duration_ms=None,
         )
@@ -1553,63 +1672,18 @@ print(json.dumps(results, ensure_ascii=False))
             ("analyze_function", query_payload),
         ]
 
+    def _normalize_idatool_name(self, tool_name: str) -> str:
+        """Normalize model-emitted idatool names to canonical catalog names."""
+        tool = (tool_name or "").strip().lower().replace("-", "_")
+        return IDATOOL_ALIASES.get(tool, tool)
+
     def _run_idatool(self, tool_name: str, payload_text: str) -> str:
         """Execute a built-in MCP-style IDA tool and return JSON output text.
 
         Uses the configured script executor so all IDA operations run on the main
         thread when needed (plugin mode), avoiding thread-affinity crashes.
         """
-        tool = tool_name.strip().lower().replace("-", "_")
-        tool_aliases = {
-            "look_up": "lookup_funcs",
-            "lookup": "lookup_funcs",
-            "lookup_function": "lookup_funcs",
-            "lookup_functions": "lookup_funcs",
-            "list_functions": "list_funcs",
-            "search_functions": "list_funcs",
-            "find_functions": "list_funcs",
-            "disassemble": "disasm",
-            "decompile_function": "decompile",
-            "xref_to": "xrefs_to",
-            "xrefs": "xrefs_to",
-            "search_string": "search_strings",
-            "find_strings": "search_strings",
-            "string_search": "search_strings",
-            "segments": "list_segments",
-            "segment_list": "list_segments",
-            "entries": "list_entries",
-            "entrypoints": "list_entries",
-            "entry_points": "list_entries",
-            "symbols": "list_names",
-            "symbol_list": "list_names",
-            "find_symbols": "list_names",
-            "scan_bytes": "find_bytes",
-            "search_bytes": "find_bytes",
-            "hexdump": "hexdump",
-            "dump_bytes": "hexdump",
-            "range_disasm": "disasm_range",
-            "disassemble_range": "disasm_range",
-            "cfg": "flowchart",
-            "control_flow": "flowchart",
-            "locals": "list_locals",
-            "list_local_vars": "list_locals",
-            "rename": "rename_symbol",
-            "rename_function": "rename_symbol",
-            "comment": "set_comment",
-            "set_func_comment": "set_comment",
-            "jump": "jump_to",
-            "goto": "jump_to",
-            "go_to": "jump_to",
-            "navigate": "jump_to",
-            "navigate_to": "jump_to",
-            "focus": "jump_to",
-            "focus_view": "jump_to",
-            "debug": "debugger",
-            "dbg": "debugger",
-            "debug_control": "debugger",
-            "debugger_control": "debugger",
-        }
-        tool = tool_aliases.get(tool, tool)
+        tool = self._normalize_idatool_name(tool_name)
         payload = self._parse_tool_payload(payload_text)
 
         script = f"""
@@ -2968,9 +3042,36 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
             return []
 
         call_meta: list[dict] = []
+        outputs: list[str] = []
         for tool_index, (tool_name, tool_payload) in enumerate(idatools_found, 1):
-            tool_display = f"idatool:{tool_name}"
-            self.callback.on_tool_use(tool_display, "mcp-style tool call")
+            canonical_tool_name = self._normalize_idatool_name(tool_name)
+            tool_display = f"idatool:{canonical_tool_name}"
+
+            if canonical_tool_name not in AVAILABLE_IDATOOLS:
+                skipped_output = json.dumps(
+                    {
+                        "tool": tool_name,
+                        "error": "Skipped malformed or unknown idatool",
+                        "normalized_tool": canonical_tool_name,
+                        "available_tools": AVAILABLE_IDATOOLS,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                self.callback.on_metric(
+                    f"Skipping unknown idatool '{tool_name}' (normalized='{canonical_tool_name}')"
+                )
+                self.callback.on_event(
+                    "idatool_response",
+                    f"IDATool Response ({tool_name})",
+                    skipped_output,
+                    duration_ms=0.0,
+                )
+                self.callback.on_script_output(skipped_output)
+                outputs.append(skipped_output)
+                continue
+
+            self.callback.on_tool_use(tool_display, tool_payload)
 
             tool_use_id = f"idatool_{int(time.time() * 1000)}_{tool_index}"
             if self.history:
@@ -2982,21 +3083,20 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
 
             self.callback.on_event(
                 "idatool_request",
-                f"IDATool Request ({tool_name})",
+                f"IDATool Request ({canonical_tool_name})",
                 tool_payload,
                 duration_ms=None,
             )
 
             call_meta.append(
                 {
-                    "tool_name": tool_name,
+                    "tool_name": canonical_tool_name,
+                    "original_tool_name": tool_name,
                     "tool_display": tool_display,
                     "tool_payload": tool_payload,
                     "tool_use_id": tool_use_id,
                 }
             )
-
-        outputs: list[str] = []
         can_parallelize = (not self._uses_custom_script_executor) and len(call_meta) > 1
 
         if can_parallelize:
@@ -3212,15 +3312,27 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
         return outputs
 
     async def _condense_history(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
-        """Condense long conversations using the cheapest available summarizer model."""
-        keep_recent = 10
-        condense_threshold = 16
-        if len(messages) <= condense_threshold:
+        """Condense oldest context when prompt usage nears model capacity."""
+        if len(messages) <= 6:
             return messages
 
+        model_name = resolve_model(self.provider_config) or self.provider_config.model or "unknown"
+        limit = get_model_context_length(model_name)
+        estimated_tokens = self._estimate_prompt_tokens(messages)
+        if estimated_tokens < (limit * 0.9):
+            return messages
+
+        keep_recent = 8
         system_message = messages[0]
-        older_messages = messages[1:-keep_recent]
-        recent_messages = messages[-keep_recent:]
+        body_messages = messages[1:]
+        compact_count = max(1, int(len(body_messages) * 0.4))
+        max_compactable = len(body_messages) - keep_recent
+        if max_compactable <= 0:
+            return messages
+
+        compact_count = min(compact_count, max_compactable)
+        older_messages = body_messages[:compact_count]
+        recent_messages = body_messages[compact_count:]
         if not older_messages:
             return messages
 
@@ -3229,7 +3341,8 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
         request_preview = json.dumps(older_messages[-8:], ensure_ascii=False, indent=2)
 
         self.callback.on_metric(
-            f"Condensing history via {cheap_model} ({len(older_messages)} messages -> summary)"
+            "Context at >=90% capacity; compacting oldest "
+            f"{len(older_messages)} of {len(body_messages)} messages (~40%) via {cheap_model}"
         )
 
         if normalize_provider(self.provider_config.provider) != "claude":
@@ -3280,6 +3393,7 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
             "content": (
                 "[Condensed conversation summary]\n"
                 f"Source model: {cheap_model}\n"
+                f"Compacted oldest messages: {len(older_messages)}\n"
                 f"{summary_text}\n\n"
                 "Prioritize the most recent messages for exact details."
             ),
@@ -3301,6 +3415,8 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
         current_input = user_input
         all_script_outputs: list[str] = []
         turn = 0
+        max_token_continuations = 2
+        token_continuations = 0
         self._cancelled = False
 
         while turn < self.max_turns:
@@ -3358,9 +3474,10 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
             request_started = time.perf_counter()
             used_streaming = False
             assistant_text = ""
+            stream_finish_reason = ""
             if not self._streaming_disabled:
                 try:
-                    assistant_text = await _query_openai_compat_stream(
+                    assistant_text, stream_finish_reason = await _query_openai_compat_stream(
                         self.provider_config,
                         condensed_messages,
                         timeout_seconds=180.0,
@@ -3369,6 +3486,8 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
                     used_streaming = True
                     self._stream_failures = 0
                     self.callback.on_metric("Streaming response enabled")
+                    if stream_finish_reason:
+                        self.callback.on_metric(f"Streaming finish reason: {stream_finish_reason}")
                 except Exception as stream_exc:
                     self._stream_failures += 1
                     err_text = str(stream_exc).strip()
@@ -3383,11 +3502,13 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
                 self.callback.on_metric("Streaming disabled for this chat; using non-streaming responses")
 
             if not used_streaming:
-                assistant_text = await _query_openai_compat(
+                assistant_text, stream_finish_reason = await _query_openai_compat_with_meta(
                     self.provider_config,
                     condensed_messages,
                     timeout_seconds=180.0,
                 )
+                if stream_finish_reason:
+                    self.callback.on_metric(f"Response finish reason: {stream_finish_reason}")
             request_elapsed_ms = (time.perf_counter() - request_started) * 1000.0
 
             self.callback.on_metric(f"Received response ({len(assistant_text)} chars)")
@@ -3399,7 +3520,21 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
             )
 
             scripts_found = extract_idascripts(assistant_text)
-            idatools_found = extract_idatool_calls(assistant_text)
+            raw_idatools_found = extract_idatool_calls(assistant_text)
+            idatools_found: list[tuple[str, str]] = []
+            skipped_tools = 0
+            for raw_name, payload in raw_idatools_found:
+                normalized_name = self._normalize_idatool_name(raw_name)
+                if normalized_name not in AVAILABLE_IDATOOLS:
+                    skipped_tools += 1
+                    continue
+                idatools_found.append((normalized_name, payload))
+
+            if skipped_tools:
+                self.callback.on_metric(
+                    f"Dropped {skipped_tools} malformed/unknown idatool wrapper(s) from model response"
+                )
+
             model_idatools_found = list(idatools_found)
             delegations = extract_delegate_calls(assistant_text)
             cleaned = self._strip_agent_tags(assistant_text)
@@ -3442,6 +3577,26 @@ print(json.dumps(result, ensure_ascii=False, indent=2))
                 self.history.append_assistant_message(cleaned)
 
             if not scripts_found and not idatools_found and not delegations:
+                if (
+                    stream_finish_reason in {"length", "max_tokens"}
+                    and token_continuations < max_token_continuations
+                    and turn < self.max_turns
+                ):
+                    token_continuations += 1
+                    self.callback.on_metric(
+                        "Model response ended at token limit; "
+                        f"requesting continuation ({token_continuations}/{max_token_continuations})"
+                    )
+                    current_input = (
+                        "[SYSTEM REMINDER: Your previous response hit max token limit. "
+                        "Continue exactly where you left off and finish the remaining answer. "
+                        "Do not restart or repeat completed sections. "
+                        "Avoid new tool calls unless essential.]"
+                    )
+                    continue
+
+                token_continuations = 0
+
                 logger.info("No scripts/tools in response - agent is done")
                 break
 

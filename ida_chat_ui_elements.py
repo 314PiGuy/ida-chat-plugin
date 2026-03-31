@@ -111,15 +111,24 @@ class CollapsibleSection(QFrame):
         self.header.setText(f"{arrow} {self._title} ({line_count} lines)")
 
     def _update_content(self):
+        def render_pre(text: str) -> str:
+            trusted_html = '<a href=' in text
+            content = text if trusted_html else html.escape(text)
+            return (
+                "<pre style='margin: 0; white-space: pre-wrap; "
+                "word-wrap: break-word; overflow-wrap: anywhere;'>"
+                f"{content}</pre>"
+            )
+
         if self._collapsed:
             # Show first few lines with ellipsis
             lines = self._content.strip().split('\n')
             preview = '\n'.join(lines[:3])
             if len(lines) > 3:
                 preview += f"\n... ({len(lines) - 3} more lines)"
-            self.content_label.setText(f"<pre>{preview}</pre>")
+            self.content_label.setText(render_pre(preview))
         else:
-            self.content_label.setText(f"<pre>{self._content}</pre>")
+            self.content_label.setText(render_pre(self._content))
 
     def _toggle(self):
         self._collapsed = not self._collapsed
@@ -146,6 +155,118 @@ class CollapsibleSection(QFrame):
         return len(content.strip().split('\n')) > CollapsibleSection.COLLAPSE_THRESHOLD
 
 
+class ToolBatchSection(QFrame):
+    """Grouped tool-call block with per-call expandable entries."""
+
+    def __init__(self, title: str = "Tool Batch", collapsed: bool = True, parent=None):
+        super().__init__(parent)
+        self._title = title
+        self._collapsed = collapsed
+        self._calls: list[dict[str, object]] = []
+        self._setup_ui()
+
+    def _setup_ui(self):
+        colors = get_ida_colors()
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self.header = QPushButton()
+        self.header.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                color: {colors['mid']};
+                border: none;
+                text-align: left;
+                padding: 2px 4px;
+                font-size: 11px;
+            }}
+            QPushButton:hover {{
+                color: {colors['text']};
+            }}
+        """)
+        self.header.clicked.connect(self._toggle)
+        layout.addWidget(self.header)
+
+        self.body = QWidget()
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(8, 0, 0, 0)
+        self.body_layout.setSpacing(4)
+        self.body.setVisible(not self._collapsed)
+        layout.addWidget(self.body)
+
+        self._update_header()
+
+    def _toggle(self):
+        self._collapsed = not self._collapsed
+        self.body.setVisible(not self._collapsed)
+        self._update_header()
+
+    def set_collapsed(self, collapsed: bool):
+        """Set collapsed state of the batch container."""
+        if self._collapsed == collapsed:
+            return
+        self._collapsed = collapsed
+        self.body.setVisible(not self._collapsed)
+        self._update_header()
+
+    def _update_header(self):
+        arrow = "▶" if self._collapsed else "▼"
+        count = len(self._calls)
+        self.header.setText(f"{arrow} {self._title} ({count} calls)")
+
+    def add_call(self, tool_name: str, request_text: str) -> int:
+        """Add one call entry and return its index."""
+        index = len(self._calls)
+        req = (request_text or "").strip() or "(empty request)"
+        content = f"Request:\n{req}\n\nResponse:\n[pending]"
+        section = CollapsibleSection(f"{index + 1}. {tool_name}", content, collapsed=True)
+        self.body_layout.addWidget(section)
+        self._calls.append(
+            {
+                "tool_name": tool_name,
+                "request": req,
+                "response": "",
+                "section": section,
+            }
+        )
+        self._update_header()
+        return index
+
+    def get_call_tool_name(self, index: int) -> str:
+        """Return tool name for one indexed call."""
+        if index < 0 or index >= len(self._calls):
+            return ""
+        return str(self._calls[index].get("tool_name", ""))
+
+    def get_call_section(self, index: int) -> CollapsibleSection | None:
+        """Return the per-call collapsible section widget."""
+        if index < 0 or index >= len(self._calls):
+            return None
+        section = self._calls[index].get("section")
+        return section if isinstance(section, CollapsibleSection) else None
+
+    def set_call_response(self, index: int, response_text: str) -> None:
+        """Attach response text to one call entry."""
+        if index < 0 or index >= len(self._calls):
+            return
+        entry = self._calls[index]
+        response = (response_text or "").strip() or "(empty response)"
+        entry["response"] = response
+        section = entry.get("section")
+        if isinstance(section, CollapsibleSection):
+            req = str(entry.get("request", ""))
+            section.set_content(f"Request:\n{req}\n\nResponse:\n{response}")
+
+    def set_all_calls_collapsed(self, collapsed: bool) -> None:
+        """Set collapsed state for all nested call sections."""
+        for entry in self._calls:
+            section = entry.get("section")
+            if isinstance(section, CollapsibleSection):
+                section.set_collapsed(collapsed)
+
+
 def markdown_to_html(text: str) -> str:
     """Convert markdown to HTML for display in QLabel with rich text."""
     import html
@@ -161,7 +282,11 @@ def markdown_to_html(text: str) -> str:
     # Code blocks (``` ... ```) - must be before inline code
     def replace_code_block(match):
         code = match.group(1)
-        return f'<pre style="background-color: {code_bg}; color: {code_fg}; padding: 8px; border-radius: 4px; overflow-x: auto;"><code>{code}</code></pre>'
+        return (
+            f'<pre style="background-color: {code_bg}; color: {code_fg}; padding: 8px; '
+            'border-radius: 4px; overflow-x: auto; white-space: pre-wrap; '
+            f'word-wrap: break-word; overflow-wrap: anywhere;"><code>{code}</code></pre>'
+        )
     text = re.sub(r'```(?:\w*\n)?(.*?)```', replace_code_block, text, flags=re.DOTALL)
 
     # Inline code (`code`)
@@ -198,7 +323,10 @@ def markdown_to_html(text: str) -> str:
     # Clean up multiple <br> tags
     text = re.sub(r'(<br>){3,}', '<br><br>', text)
 
-    return text
+    return (
+        "<div style='white-space: normal; word-wrap: break-word; "
+        f"overflow-wrap: anywhere;'>{text}</div>"
+    )
 
 
 class MessageType:
@@ -460,7 +588,11 @@ class ChatMessage(QFrame):
 
     def _render_stream_text(self, text: str) -> str:
         """Render lightweight streaming text without full markdown conversion."""
-        return html.escape(text).replace("\n", "<br>")
+        escaped = html.escape(text).replace("\n", "<br>")
+        return (
+            "<div style='white-space: normal; word-wrap: break-word; "
+            f"overflow-wrap: anywhere;'>{escaped}</div>"
+        )
 
     def update_text(self, text: str):
         """Update the message text."""
@@ -539,6 +671,13 @@ class ChatHistoryWidget(QScrollArea):
         self.scroll_to_bottom()
         return section
 
+    def add_tool_batch(self, title: str = "Tool Batch", collapsed: bool = True) -> ToolBatchSection:
+        """Add one grouped tool batch section to the chat history."""
+        batch = ToolBatchSection(title=title, collapsed=collapsed)
+        self.layout.addWidget(batch)
+        self.scroll_to_bottom()
+        return batch
+
     def clear_history(self):
         """Clear all messages from the chat history."""
         self._current_processing_message = None
@@ -555,6 +694,9 @@ class EventLogWidget(QScrollArea):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._entries: list[dict[str, str | float | None]] = []
+        self._entry_widgets: list[tuple[dict[str, str | float | None], QFrame]] = []
+        self._kind_filter = ""
+        self._text_filter = ""
         self._setup_ui()
 
     def _setup_ui(self):
@@ -573,6 +715,7 @@ class EventLogWidget(QScrollArea):
     def clear_events(self):
         """Clear all recorded events from the panel."""
         self._entries.clear()
+        self._entry_widgets.clear()
         while self.layout.count() > 1:
             item = self.layout.takeAt(0)
             if item and item.widget():
@@ -621,12 +764,44 @@ class EventLogWidget(QScrollArea):
             }
         )
 
+        entry_ref = self._entries[-1]
+
         if details.strip():
             section = CollapsibleSection("Details", details, collapsed=True)
             frame_layout.addWidget(section)
 
         self.layout.insertWidget(self.layout.count() - 1, frame)
+        self._entry_widgets.append((entry_ref, frame))
+        self._apply_filters()
         QTimer.singleShot(10, lambda: self.verticalScrollBar().setValue(self.verticalScrollBar().maximum()))
+
+    def set_kind_filter(self, kind: str) -> None:
+        """Filter events by kind; empty means show all."""
+        self._kind_filter = (kind or "").strip().lower()
+        self._apply_filters()
+
+    def set_text_filter(self, text: str) -> None:
+        """Filter events by case-insensitive substring in title/details."""
+        self._text_filter = (text or "").strip().lower()
+        self._apply_filters()
+
+    def _matches_filter(self, entry: dict[str, str | float | None]) -> bool:
+        kind_filter = self._kind_filter
+        if kind_filter and str(entry.get("kind", "")).strip().lower() != kind_filter:
+            return False
+
+        text_filter = self._text_filter
+        if not text_filter:
+            return True
+
+        haystack = (
+            f"{entry.get('title', '')}\n{entry.get('details', '')}\n{entry.get('kind', '')}"
+        ).lower()
+        return text_filter in haystack
+
+    def _apply_filters(self) -> None:
+        for entry, frame in self._entry_widgets:
+            frame.setVisible(self._matches_filter(entry))
 
     def to_plain_text(self) -> str:
         """Return the complete event log as plain text for copy/paste diagnostics."""

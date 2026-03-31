@@ -80,6 +80,7 @@ from ida_chat_ui_elements import (
     EventLogWidget,
     MessageType,
     ProgressTimeline,
+    ToolBatchSection,
 )
 
 
@@ -959,6 +960,8 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self._stream_wrapper_close_tag = ""
         self._stream_wrapper_buffer = ""
         self._stream_wrapper_section: CollapsibleSection | None = None
+        self._active_tool_batch: ToolBatchSection | None = None
+        self._active_tool_calls: list[dict[str, object]] = []
         self._details_expanded = False
         self._active_session_id: str | None = None
         self._updating_session_list = False
@@ -1434,10 +1437,12 @@ class IDAChatForm(ida_kernwin.PluginForm):
     def _on_thinking(self):
         """Called when agent starts processing."""
         self._is_processing = True
+        self._close_tool_batch()
         self._streaming_active = False
         self._stream_buffer = ""
         self._stream_pending = ""
         self._reset_stream_wrapper_state()
+        self._close_tool_batch()
         if self._stream_flush_timer.isActive():
             self._stream_flush_timer.stop()
         # Mark previous message as complete before starting new turn
@@ -1599,6 +1604,52 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self._stream_wrapper_buffer = ""
         self._stream_wrapper_section = None
 
+    def _ensure_tool_batch(self) -> ToolBatchSection:
+        """Create grouped tool batch section when the first tool call arrives."""
+        if self._active_tool_batch is None:
+            if self._current_message:
+                self._current_message.set_complete()
+                self._current_message = None
+            self._active_tool_batch = self.chat_history.add_tool_batch("Tool Calls", collapsed=True)
+            self._active_tool_calls = []
+        return self._active_tool_batch
+
+    def _close_tool_batch(self) -> None:
+        """Close active tool batch tracking after tool phase finishes."""
+        self._active_tool_batch = None
+        self._active_tool_calls = []
+
+    def _attach_tool_response(self, tool_name: str, response_text: str) -> bool:
+        """Attach one tool response to the best matching pending call entry."""
+        if not self._active_tool_batch or not self._active_tool_calls:
+            return False
+
+        normalized = (tool_name or "").strip().lower()
+        target_index = -1
+
+        for item in self._active_tool_calls:
+            item_tool = str(item.get("tool_name", "")).strip().lower()
+            if item.get("response_attached"):
+                continue
+            if normalized and item_tool == normalized:
+                target_index = int(item.get("batch_index", -1))
+                item["response_attached"] = True
+                break
+
+        if target_index < 0:
+            for item in self._active_tool_calls:
+                if item.get("response_attached"):
+                    continue
+                target_index = int(item.get("batch_index", -1))
+                item["response_attached"] = True
+                break
+
+        if target_index < 0:
+            return False
+
+        self._active_tool_batch.set_call_response(target_index, response_text)
+        return True
+
     def _begin_stream_wrapper(self, kind: str, close_tag: str, opening_tag: str):
         """Start collecting a streamed wrapper into a collapsed details block."""
         if self._thinking_message:
@@ -1616,11 +1667,31 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self._stream_wrapper_close_tag = close_tag.lower()
         self._stream_wrapper_buffer = opening_tag
 
+        normalized_opening_tag = opening_tag
         if kind == "idatool":
-            tool_name = extract_opening_tag_target(opening_tag, "idatool", "name")
+            normalized_opening_tag = re.sub(
+                r"^<\s*idatool([a-z0-9_./:-]+)\s*>",
+                r"<idatool \1>",
+                opening_tag,
+                flags=re.IGNORECASE,
+            )
+        elif kind == "delegate":
+            normalized_opening_tag = re.sub(
+                r"^<\s*delegate([a-z0-9_./:-]+)\s*>",
+                r"<delegate \1>",
+                opening_tag,
+                flags=re.IGNORECASE,
+            )
+
+        if kind == "idatool":
+            tool_name = extract_opening_tag_target(normalized_opening_tag, "idatool", "name")
             title = f"Model Tool Call ({tool_name})" if tool_name else "Model Tool Call"
+        elif kind == "idascript":
+            title = "Model Script Block"
+        elif kind == "parallel":
+            title = "Model Parallel Block"
         else:
-            agent_name = extract_opening_tag_target(opening_tag, "delegate", "agent")
+            agent_name = extract_opening_tag_target(normalized_opening_tag, "delegate", "agent")
             title = f"Model Delegate Call ({agent_name})" if agent_name else "Model Delegate Call"
 
         self._stream_wrapper_section = self.chat_history.add_collapsible(
@@ -1654,6 +1725,8 @@ class IDAChatForm(ida_kernwin.PluginForm):
         wrapper_markers = [
             ("<idatool", "idatool", "</idatool>"),
             ("<delegate", "delegate", "</delegate>"),
+            ("<idascript", "idascript", "</idascript>"),
+            ("<parallel", "parallel", "</parallel>"),
         ]
         lookbehind = max(len(marker[0]) for marker in wrapper_markers) - 1
 
@@ -1698,7 +1771,11 @@ class IDAChatForm(ida_kernwin.PluginForm):
                 if idx >= 0 and (next_open_idx < 0 or idx < next_open_idx):
                     next_open_idx = idx
 
-            if next_open_idx >= 0 and (close_idx < 0 or next_open_idx < close_idx):
+            if (
+                self._stream_wrapper_kind != "parallel"
+                and next_open_idx >= 0
+                and (close_idx < 0 or next_open_idx < close_idx)
+            ):
                 if next_open_idx > 0:
                     self._append_stream_wrapper_text(self._stream_tag_buffer[:next_open_idx])
                 self._stream_tag_buffer = self._stream_tag_buffer[next_open_idx:]
@@ -1748,14 +1825,20 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self._stream_buffer = ""
         self._stream_pending = ""
         self._reset_stream_wrapper_state()
-        tool_msg = f"[{tool_name}]"
-        if details:
-            tool_msg += " call"
-        self._add_processing_message(tool_msg, MessageType.TOOL_USE)
+
+        batch = self._ensure_tool_batch()
+        call_index = batch.add_call(tool_name, details)
+        self._attach_collapsible_link_handler(batch.get_call_section(call_index))
+        self._active_tool_calls.append(
+            {
+                "tool_name": tool_name,
+                "batch_index": call_index,
+                "response_attached": False,
+            }
+        )
+
         self._log_metric(f"Tool executed: {tool_name} (details: {details[:100]}...)")
-        if details.strip():
-            section = self.chat_history.add_collapsible(f"{tool_name} Details", details, collapsed=True)
-            self._attach_collapsible_link_handler(section)
+        self.chat_history.scroll_to_bottom_now()
 
     def _flush_stream_text(self):
         """Flush pending streamed chunks into a single UI update."""
@@ -1820,8 +1903,23 @@ class IDAChatForm(ida_kernwin.PluginForm):
                 # Mark previous message as complete
                 if self._current_message:
                     self._current_message.set_complete()
-                title = "Tool Output" if is_tool_json else "Script Output"
+                tool_name = ""
+                if is_tool_json:
+                    try:
+                        parsed = json.loads(output)
+                        if isinstance(parsed, dict):
+                            tool_name = str(parsed.get("tool", "")).strip()
+                    except Exception:
+                        tool_name = ""
+
                 display_output = self._linkify_tool_output(output) if is_tool_json else output
+
+                if is_tool_json and self._attach_tool_response(tool_name, display_output):
+                    self._current_message = None
+                    self.chat_history.scroll_to_bottom_now()
+                    return
+
+                title = f"Tool Output ({tool_name})" if tool_name else ("Tool Output" if is_tool_json else "Script Output")
                 section = self.chat_history.add_collapsible(title, display_output, collapsed=True)
                 self._attach_collapsible_link_handler(section)
                 self._current_message = None
@@ -1842,6 +1940,7 @@ class IDAChatForm(ida_kernwin.PluginForm):
         """Called when agent finishes processing."""
         self._flush_stream_tag_parser()
         self._flush_stream_text()
+        self._close_tool_batch()
         self._is_processing = False
         self._streaming_active = False
         self._stream_buffer = ""
@@ -2209,6 +2308,54 @@ class IDAChatForm(ida_kernwin.PluginForm):
         clear_events_btn.clicked.connect(self._on_clear_events)
         metrics_toolbar_layout.addWidget(clear_events_btn)
 
+        kind_label = QLabel("Kind:")
+        kind_label.setStyleSheet(f"color: {colors['mid']};")
+        metrics_toolbar_layout.addWidget(kind_label)
+
+        self.events_kind_filter = QComboBox()
+        self.events_kind_filter.addItems(
+            [
+                "All",
+                "metric",
+                "model_request",
+                "model_response",
+                "idatool_request",
+                "idatool_response",
+                "delegate_request",
+                "delegate_response",
+                "script_input",
+                "script_output",
+                "context_warning",
+                "condense",
+            ]
+        )
+        self.events_kind_filter.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {colors['base']};
+                color: {colors['text']};
+                border: 1px solid {colors['mid']};
+                border-radius: 4px;
+                padding: 1px 6px;
+                min-width: 160px;
+            }}
+        """)
+        self.events_kind_filter.currentTextChanged.connect(self._on_event_kind_filter_changed)
+        metrics_toolbar_layout.addWidget(self.events_kind_filter)
+
+        self.events_text_filter = QLineEdit()
+        self.events_text_filter.setPlaceholderText("Filter details text...")
+        self.events_text_filter.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: {colors['base']};
+                color: {colors['text']};
+                border: 1px solid {colors['mid']};
+                border-radius: 4px;
+                padding: 2px 8px;
+            }}
+        """)
+        self.events_text_filter.textChanged.connect(self._on_event_text_filter_changed)
+        metrics_toolbar_layout.addWidget(self.events_text_filter, stretch=1)
+
         metrics_layout.addWidget(metrics_toolbar)
 
         self.events_log = EventLogWidget()
@@ -2273,6 +2420,9 @@ class IDAChatForm(ida_kernwin.PluginForm):
             widget = item.widget()
             if isinstance(widget, CollapsibleSection):
                 widget.set_collapsed(target_collapsed)
+            elif isinstance(widget, ToolBatchSection):
+                widget.set_collapsed(target_collapsed)
+                widget.set_all_calls_collapsed(target_collapsed)
 
         state = "expanded" if self._details_expanded else "collapsed"
         self._log_metric(f"Detail sections {state}")
@@ -2355,6 +2505,15 @@ class IDAChatForm(ida_kernwin.PluginForm):
         self.input_widget.setEnabled(True)
         self.input_widget.setFocus()
         self._update_status_bar()
+
+    def _on_event_kind_filter_changed(self, selected: str):
+        """Filter event log by selected event kind."""
+        kind = "" if (selected or "").strip().lower() == "all" else (selected or "").strip()
+        self.events_log.set_kind_filter(kind)
+
+    def _on_event_text_filter_changed(self, text: str):
+        """Filter event log by text content."""
+        self.events_log.set_text_filter(text or "")
 
     def _on_clear_events(self):
         """Clear metrics/events panel entries."""

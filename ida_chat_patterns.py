@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
 
 IDASCRIPT_PATTERN = re.compile(r"<idascript>(.*?)</idascript>", re.DOTALL)
@@ -28,6 +29,18 @@ class AgentTagBlock:
 TAG_OPEN_PATTERN = re.compile(r"<\s*(idascript|idatool|delegate)\b([^>]*)>", re.IGNORECASE)
 
 
+def _normalize_agent_text(text: str) -> str:
+    """Normalize common malformed wrappers seen in model output."""
+    text = text or ""
+    text = re.sub(r"</?\s*parallel\b[^>]*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<\s*legate\b", "<delegate", text, flags=re.IGNORECASE)
+    text = re.sub(r"</\s*legate\s*>", "</delegate>", text, flags=re.IGNORECASE)
+    text = re.sub(r"</\s*idatools\s*>", "</idatool>", text, flags=re.IGNORECASE)
+    text = re.sub(r"<\s*idatool([a-z0-9_./:-]+)\s*>", r"<idatool \1>", text, flags=re.IGNORECASE)
+    text = re.sub(r"<\s*delegate([a-z0-9_./:-]+)\s*>", r"<delegate \1>", text, flags=re.IGNORECASE)
+    return text
+
+
 def _extract_named_attr(attrs: str, key: str) -> str:
     pattern = rf"\b{re.escape(key)}\s*=\s*(?:'([^']+)'|\"([^\"]+)\"|([^\s>]+))"
     match = re.search(pattern, attrs, flags=re.IGNORECASE)
@@ -46,6 +59,39 @@ def _extract_loose_attr_token(attrs: str) -> str:
             continue
         return token
     return ""
+
+
+def _normalize_wrapper_payload(payload: str) -> str:
+    """Normalize wrapper payload text before lightweight validation."""
+    text = (payload or "").strip()
+    text = re.sub(r"^\s*<!\[CDATA\[", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\]\]>\s*$", "", text, flags=re.IGNORECASE)
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def _looks_structured_payload(payload: str) -> bool:
+    """Return True when payload starts like JSON/JSON-string content."""
+    normalized = _normalize_wrapper_payload(payload)
+    if not normalized:
+        return False
+    return normalized.startswith("{") or normalized.startswith("[") or normalized.startswith('"')
+
+
+def _extract_leading_structured_payload(payload: str) -> str:
+    """Extract first valid JSON value from payload, tolerating trailing spillover."""
+    normalized = _normalize_wrapper_payload(payload)
+    if not _looks_structured_payload(normalized):
+        return ""
+
+    try:
+        _, end_index = json.JSONDecoder().raw_decode(normalized)
+    except Exception:
+        return ""
+
+    return normalized[:end_index].strip()
 
 
 def extract_opening_tag_target(opening_tag: str, tag_name: str, attr_name: str) -> str:
@@ -68,7 +114,7 @@ def parse_agent_blocks(text: str) -> list[AgentTagBlock]:
     - End it at the next known wrapper opening tag, if present.
     - Otherwise, end it at the end of text.
     """
-    text = text or ""
+    text = _normalize_agent_text(text)
     if not text:
         return []
 
@@ -143,7 +189,18 @@ def extract_idatool_calls(text: str) -> list[tuple[str, str]]:
         name = name.strip().lower().replace("-", "_")
         if not name:
             continue
-        calls.append((name, block.content.strip()))
+
+        payload_text = block.content.strip()
+        leading_payload = _extract_leading_structured_payload(payload_text)
+        if leading_payload:
+            payload_text = leading_payload
+
+        # Recovered wrappers are useful for multi-tool extraction, but if the
+        # payload is plain prose then it is almost always malformed spillover.
+        if block.recovered and not _looks_structured_payload(payload_text):
+            continue
+
+        calls.append((name, payload_text))
     return calls
 
 
@@ -163,17 +220,17 @@ def extract_delegate_calls(text: str) -> list[tuple[str, str]]:
 
 def strip_agent_tags(text: str) -> str:
     """Remove parsed idascript/idatool/delegate wrappers from text."""
-    text = text or ""
-    blocks = parse_agent_blocks(text)
+    normalized_text = _normalize_agent_text(text)
+    blocks = parse_agent_blocks(normalized_text)
     if not blocks:
-        return text.strip()
+        return normalized_text.strip()
 
     chunks: list[str] = []
     cursor = 0
     for block in blocks:
         if block.start > cursor:
-            chunks.append(text[cursor:block.start])
+            chunks.append(normalized_text[cursor:block.start])
         cursor = max(cursor, block.end)
-    if cursor < len(text):
-        chunks.append(text[cursor:])
+    if cursor < len(normalized_text):
+        chunks.append(normalized_text[cursor:])
     return "".join(chunks).strip()
